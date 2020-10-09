@@ -17,7 +17,7 @@ services:
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'mainnet:http://192.168.112.1:7545'
+      ethereum: 'mainnet:http://host.docker.internal:7545'
       RUST_LOG: info
   ipfs:
     image: ipfs/go-ipfs:v0.4.23
