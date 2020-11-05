@@ -1,7 +1,10 @@
 #!/bin/bash
 
-docker-compose down -v;
-./setup.sh
+if [ "$1" = "setup" ]
+then
+	docker-compose down -v;
+	./setup.sh;
+fi
 
 if [ -d "data" ]
 then
