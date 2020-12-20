@@ -9,32 +9,32 @@ services:
   graph-node:
     image: graphprotocol/graph-node
     ports:
-      - '8000:8000'
-      - '8001:8001'
-      - '8020:8020'
-      - '8030:8030'
-      - '8040:8040'
+      - '8200:8000'
+      - '8201:8001'
+      - '8220:8020'
+      - '8230:8030'
+      - '8240:8040'
     depends_on:
       - ipfs
       - postgres
     environment:
-      postgres_host: postgres:5432
+      postgres_host: postgres
       postgres_user: graph-node
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'mainnet:http://172.16.57.1:7545'
+      ethereum: 'kovan:https://kovan.infura.io/v3/4aaace1ae3d8484f81138b24012ae2d2'
       RUST_LOG: info
   ipfs:
     image: ipfs/go-ipfs:v0.4.23
     ports:
-      - '5001:5001'
+      - '5201:5001'
     volumes:
       - ./data/ipfs:/data/ipfs
   postgres:
     image: postgres
     ports:
-      - '54320:5432'
+      - '54322:5432'
     command: ["postgres", "-cshared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: graph-node

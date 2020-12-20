@@ -9,32 +9,32 @@ services:
   graph-node:
     image: graphprotocol/graph-node
     ports:
-      - '8000:8000'
-      - '8001:8001'
-      - '8020:8020'
-      - '8030:8030'
-      - '8040:8040'
+      - '{port.graph.1}:8000'
+      - '{port.graph.2}:8001'
+      - '{port.graph.3}:8020'
+      - '{port.graph.4}:8030'
+      - '{port.graph.5}:8040'
     depends_on:
       - ipfs
       - postgres
     environment:
-      postgres_host: postgres:5432
+      postgres_host: postgres
       postgres_user: graph-node
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'mainnet:http://host.docker.internal:7545'
+      ethereum: '{ethereum.host}'
       RUST_LOG: info
   ipfs:
     image: ipfs/go-ipfs:v0.4.23
     ports:
-      - '5001:5001'
+      - '{port.ipfs}:5001'
     volumes:
       - ./data/ipfs:/data/ipfs
   postgres:
     image: postgres
     ports:
-      - '54320:5432'
+      - '{port.pg}:5432'
     command: ["postgres", "-cshared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: graph-node
