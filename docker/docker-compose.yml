@@ -25,6 +25,7 @@ services:
       ipfs: 'ipfs:5001'
       ethereum: 'kovan:https://kovan.infura.io/v3/4aaace1ae3d8484f81138b24012ae2d2'
       RUST_LOG: info
+      ETHEREUM_POLLING_INTERVAL: 5000
   ipfs:
     image: ipfs/go-ipfs:v0.4.23
     ports:
