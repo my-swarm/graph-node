@@ -11,6 +11,7 @@ if [ "$1" == "kovan" ]; then
 	PORT_GRAPH_3=8220
 	PORT_GRAPH_4=8230
 	PORT_GRAPH_5=8240
+#	ETHEREUM_HOST="kovan:http:\/\/{host.docker.internal}:8545"
 	ETHEREUM_HOST="kovan:https:\/\/kovan.infura.io\/v3\/4aaace1ae3d8484f81138b24012ae2d2"
 
 elif [ "$1" == "mainnet" ]; then
@@ -62,7 +63,7 @@ function stop_graph_node {
   docker-compose stop graph-node
 }
 
-if [ "$NETWORK" == "local" ]; then
+#if [ "$NETWORK" == "local" ]; then
   # Create the graph-node container
   docker-compose up --no-start graph-node
 
@@ -79,8 +80,8 @@ if [ "$NETWORK" == "local" ]; then
   sed -e "s/{host.docker.internal}/$HOST_IP/g" docker-compose.yml.tmp > docker-compose.yml
 
   trap stop_graph_node EXIT
-else
-  mv docker-compose.yml.tmp docker-compose.yml
-fi
+#else
+ # mv docker-compose.yml.tmp docker-compose.yml
+#fi
 echo "Ethereum host: $ETHEREUM_HOST"
 

@@ -25,6 +25,7 @@ services:
       ipfs: 'ipfs:5001'
       ethereum: '{ethereum.host}'
       RUST_LOG: info
+      ETHEREUM_POLLING_INTERVAL: 5000
   ipfs:
     image: ipfs/go-ipfs:v0.4.23
     ports:
