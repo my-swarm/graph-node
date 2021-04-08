@@ -35,7 +35,7 @@ else
 	PORT_GRAPH_3=8120
 	PORT_GRAPH_4=8130
 	PORT_GRAPH_5=8140
-	ETHEREUM_HOST="mainnet:http:\/\/{host.docker.internal}:7545"
+	ETHEREUM_HOST="mainnet:http:\/\/{host.docker.internal}:8545"
 fi
 
 sed -e "s/{ethereum.host}/$ETHEREUM_HOST/g; s/{port.ipfs}/$PORT_IPFS/g; s/{port.pg}/$PORT_PG/g; s/{port.graph.1}/$PORT_GRAPH_1/g; s/{port.graph.2}/$PORT_GRAPH_2/g; s/{port.graph.3}/$PORT_GRAPH_3/g; s/{port.graph.4}/$PORT_GRAPH_4/g; s/{port.graph.5}/$PORT_GRAPH_5/g;" docker-compose.yml.template > docker-compose.yml.tmp
