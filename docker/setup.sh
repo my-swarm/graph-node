@@ -12,7 +12,7 @@ if [ "$1" == "kovan" ]; then
 	PORT_GRAPH_4=8230
 	PORT_GRAPH_5=8240
 #	ETHEREUM_HOST="kovan:http:\/\/{host.docker.internal}:8545"
-	ETHEREUM_HOST="kovan:https:\/\/kovan.infura.io\/v3\/4aaace1ae3d8484f81138b24012ae2d2"
+	ETHEREUM_HOST="kovan:https:\/\/eth-kovan.alchemyapi.io\/v2\/Sb74BO2GTM5-9rUJcc441atUNbKYTekj"
 
 elif [ "$1" == "mainnet" ]; then
   echo "Setting up for mainnet"
