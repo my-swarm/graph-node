@@ -14,8 +14,10 @@ mod module;
 /// Runtime-agnostic implementation of exports to WASM.
 mod host_exports;
 
+mod error;
+
 use graph::prelude::web3::types::Address;
-use graph::prelude::{Store, SubgraphDeploymentStore};
+use graph::prelude::SubgraphStore;
 
 #[derive(Clone, Debug)]
 pub(crate) struct UnresolvedContractCall {
@@ -26,5 +28,5 @@ pub(crate) struct UnresolvedContractCall {
     pub function_args: Vec<ethabi::Token>,
 }
 
-trait RuntimeStore: Store + SubgraphDeploymentStore {}
-impl<S: Store + SubgraphDeploymentStore> RuntimeStore for S {}
+trait RuntimeStore: SubgraphStore {}
+impl<S: SubgraphStore> RuntimeStore for S {}

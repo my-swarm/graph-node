@@ -8,38 +8,51 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ethabi::ParamType;
-use graph::components::ethereum::{EthereumAdapter as EthereumAdapterTrait, *};
 use graph::prelude::{
-    debug, err_msg, error, ethabi, format_err,
+    anyhow, async_trait, debug, error, ethabi,
     futures03::{self, compat::Future01CompatExt, FutureExt, StreamExt, TryStreamExt},
-    hex, retry, stream, tiny_keccak, trace, warn, web3, ChainStore, CheapClone, DynTryFuture,
-    Error, EthereumCallCache, Logger, TimeoutError,
+    hex, retry, stream, tiny_keccak, trace, warn,
+    web3::{
+        self,
+        types::{
+            Address, Block, BlockId, BlockNumber as Web3BlockNumber, Bytes, CallRequest,
+            FilterBuilder, Log, H256,
+        },
+    },
+    BlockNumber, ChainStore, CheapClone, DynTryFuture, Error, EthereumCallCache, Logger,
+    TimeoutError,
+};
+use graph::{
+    components::ethereum::{EthereumAdapter as EthereumAdapterTrait, *},
+    prelude::web3::types::{Trace, TraceFilter, TraceFilterBuilder, H160},
 };
 use web3::api::Web3;
 use web3::transports::batch::Batch;
-use web3::types::{Filter, *};
+use web3::types::Filter;
 
 #[derive(Clone)]
 pub struct EthereumAdapter<T: web3::Transport> {
+    logger: Logger,
     url_hostname: Arc<String>,
+    provider: String,
     web3: Arc<Web3<T>>,
     metrics: Arc<ProviderEthRpcMetrics>,
-    is_ganache: bool,
+    supports_eip_1898: bool,
 }
 
 lazy_static! {
-    static ref TRACE_STREAM_STEP_SIZE: u64 = std::env::var("ETHEREUM_TRACE_STREAM_STEP_SIZE")
+    static ref TRACE_STREAM_STEP_SIZE: BlockNumber = std::env::var("ETHEREUM_TRACE_STREAM_STEP_SIZE")
         .unwrap_or("200".into())
-        .parse::<u64>()
+        .parse::<BlockNumber>()
         .expect("invalid trace stream step size");
 
     /// Maximum range size for `eth.getLogs` requests that dont filter on
     /// contract address, only event signature, and are therefore expensive.
     ///
     /// According to Ethereum node operators, size 500 is reasonable here.
-    static ref MAX_EVENT_ONLY_RANGE: u64 = std::env::var("GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE")
+    static ref MAX_EVENT_ONLY_RANGE: BlockNumber = std::env::var("GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE")
         .unwrap_or("500".into())
-        .parse::<u64>()
+        .parse::<BlockNumber>()
         .expect("invalid number of parallel Ethereum block ranges to scan");
 
     static ref BLOCK_BATCH_SIZE: usize = std::env::var("ETHEREUM_BLOCK_BATCH_SIZE")
@@ -66,18 +79,17 @@ lazy_static! {
 
     /// Log eth_call data and target address at trace level. Turn on for debugging.
     static ref ETH_CALL_FULL_LOG: bool = std::env::var("GRAPH_ETH_CALL_FULL_LOG").is_ok();
-
-    /// This is not deterministic and will be removed after the testnet.
-    static ref ETH_CALL_BY_NUMBER: bool = std::env::var("GRAPH_ETH_CALL_BY_NUMBER").is_ok();
 }
 
 impl<T: web3::Transport> CheapClone for EthereumAdapter<T> {
     fn cheap_clone(&self) -> Self {
         Self {
+            logger: self.logger.clone(),
+            provider: self.provider.clone(),
             url_hostname: self.url_hostname.cheap_clone(),
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
-            is_ganache: self.is_ganache,
+            supports_eip_1898: self.supports_eip_1898,
         }
     }
 }
@@ -89,9 +101,12 @@ where
     T::Out: Send,
 {
     pub async fn new(
+        logger: Logger,
+        provider: String,
         url: &str,
         transport: T,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
+        supports_eip_1898: bool,
     ) -> Self {
         // Unwrap: The transport was constructed with this url, so it is valid and has a host.
         let hostname = graph::url::Url::parse(url)
@@ -113,10 +128,12 @@ where
             .unwrap_or(false);
 
         EthereumAdapter {
+            logger,
+            provider,
             url_hostname: Arc::new(hostname),
             web3,
             metrics: provider_metrics,
-            is_ganache,
+            supports_eip_1898: supports_eip_1898 && !is_ganache,
         }
     }
 
@@ -124,8 +141,8 @@ where
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         addresses: Vec<H160>,
     ) -> impl Future<Item = Vec<Trace>, Error = Error> {
         let eth = self.clone();
@@ -197,7 +214,7 @@ where
             })
             .map_err(move |e| {
                 e.into_inner().unwrap_or_else(move || {
-                    format_err!(
+                    anyhow::anyhow!(
                         "Ethereum node took too long to respond to trace_filter \
                          (from block {}, to block {})",
                         from,
@@ -211,8 +228,8 @@ where
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         filter: Arc<EthGetLogsFilter>,
         too_many_logs_fingerprints: &'static [&'static str],
     ) -> impl Future<Item = Vec<Log>, Error = TimeoutError<web3::error::Error>> {
@@ -258,8 +275,8 @@ where
         self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         addresses: Vec<H160>,
     ) -> impl Stream<Item = Trace, Error = Error> + Send {
         if from > to {
@@ -308,8 +325,8 @@ where
         &self,
         logger: Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         filter: EthGetLogsFilter,
     ) -> DynTryFuture<'static, Vec<Log>, Error> {
         // Codes returned by Ethereum node providers if an eth_getLogs request is too heavy.
@@ -387,7 +404,7 @@ where
                             Ok(Some((vec![], (start, new_step))))
                         } else {
                             warn!(logger, "Unexpected RPC error"; "error" => &string_err);
-                            Err(err_msg(string_err))
+                            Err(anyhow!("{}", string_err))
                         }
                     }
                     Ok(logs) => Ok(Some((logs, (end + 1, step)))),
@@ -409,10 +426,10 @@ where
 
         // Ganache does not support calls by block hash.
         // See https://github.com/trufflesuite/ganache-cli/issues/745
-        let block_id = if self.is_ganache || *ETH_CALL_BY_NUMBER {
+        let block_id = if !self.supports_eip_1898 {
             BlockId::Number(block_ptr.number.into())
         } else {
-            BlockId::Hash(block_ptr.hash)
+            BlockId::Hash(block_ptr.hash_as_h256())
         };
 
         retry("eth_call RPC call", &logger)
@@ -432,20 +449,12 @@ where
                     data: Some(call_data.clone()),
                 };
                 web3.eth().call(req, Some(block_id)).then(|result| {
-                    // Try to check if the call was reverted. The JSON-RPC response for
-                    // reverts is not standardized, the current situation for the tested
-                    // clients is:
-                    //
-                    // - Parity returns a reliable RPC error response for reverts.
-                    // - Ganache also returns a reliable RPC error.
-                    // - Geth now also returns an RPC error. It used to return `0x` on a
-                    //   revert with no reason string, or a Solidity encoded `Error(string)`
-                    //   call from `revert` and `require` calls with a reason string. We
-                    //   still have support for those but that can be removed on the next
-                    //   hard fork (Berlin).
+                    // Try to check if the call was reverted. The JSON-RPC response for reverts is
+                    // not standardized, so we have ad-hoc checks for each of Geth, Parity and
+                    // Ganache.
 
-                    // 0xfe is the "designated bad instruction" of the EVM, and Solidity
-                    // uses it for asserts.
+                    // 0xfe is the "designated bad instruction" of the EVM, and Solidity uses it for
+                    // asserts.
                     const PARITY_BAD_INSTRUCTION_FE: &str = "Bad instruction fe";
 
                     // 0xfd is REVERT, but on some contracts, and only on older blocks,
@@ -453,6 +462,8 @@ where
                     const PARITY_BAD_INSTRUCTION_FD: &str = "Bad instruction fd";
 
                     const PARITY_BAD_JUMP_PREFIX: &str = "Bad jump";
+                    const PARITY_STACK_LIMIT_PREFIX: &str = "Out of stack";
+
                     const GANACHE_VM_EXECUTION_ERROR: i64 = -32000;
                     const GANACHE_REVERT_MESSAGE: &str =
                         "VM Exception while processing transaction: revert";
@@ -466,6 +477,8 @@ where
                         "execution reverted",
                         "invalid jump destination",
                         "invalid opcode",
+                        // Ethereum says 1024 is the stack sizes limit, so this is deterministic.
+                        "stack limit reached 1024",
                     ];
 
                     let as_solidity_revert_with_reason = |bytes: &[u8]| {
@@ -481,11 +494,8 @@ where
                     };
 
                     match result {
-                        // Check for old Geth revert with reason.
-                        Ok(bytes) => match as_solidity_revert_with_reason(&bytes.0) {
-                            None => Ok(bytes),
-                            Some(reason) => Err(EthereumContractCallError::Revert(reason)),
-                        },
+                        // A successful response.
+                        Ok(bytes) => Ok(bytes),
 
                         // Check for Geth revert.
                         Err(web3::Error::Rpc(rpc_error))
@@ -504,6 +514,7 @@ where
                                 Some(data)
                                     if data.starts_with(PARITY_REVERT_PREFIX)
                                         || data.starts_with(PARITY_BAD_JUMP_PREFIX)
+                                        || data.starts_with(PARITY_STACK_LIMIT_PREFIX)
                                         || data == PARITY_BAD_INSTRUCTION_FE
                                         || data == PARITY_BAD_INSTRUCTION_FD =>
                                 {
@@ -561,10 +572,9 @@ where
                     web3.eth()
                         .block_with_txs(BlockId::Hash(hash))
                         .from_err::<Error>()
-                        .map_err(|e| e.compat())
                         .and_then(move |block| {
                             block.ok_or_else(|| {
-                                format_err!("Ethereum node did not find block {:?}", hash).compat()
+                                anyhow::anyhow!("Ethereum node did not find block {:?}", hash)
                             })
                         })
                 })
@@ -579,7 +589,7 @@ where
     fn load_block_ptrs_rpc(
         &self,
         logger: Logger,
-        block_nums: Vec<u64>,
+        block_nums: Vec<BlockNumber>,
     ) -> impl Stream<Item = EthereumBlockPointer, Error = Error> + Send {
         let web3 = self.web3.clone();
 
@@ -590,13 +600,11 @@ where
                 .timeout_secs(*JSON_RPC_TIMEOUT)
                 .run(move || {
                     web3.eth()
-                        .block(BlockId::Number(BlockNumber::Number(block_num.into())))
+                        .block(BlockId::Number(Web3BlockNumber::Number(block_num.into())))
                         .from_err::<Error>()
-                        .map_err(|e| e.compat())
                         .and_then(move |block| {
                             block.ok_or_else(|| {
-                                format_err!("Ethereum node did not find block {:?}", block_num)
-                                    .compat()
+                                anyhow!("Ethereum node did not find block {:?}", block_num)
                             })
                         })
                 })
@@ -607,6 +615,7 @@ where
     }
 }
 
+#[async_trait]
 impl<T> EthereumAdapterTrait for EthereumAdapter<T>
 where
     T: web3::BatchTransport + Send + Sync + 'static,
@@ -617,11 +626,12 @@ where
         &self.url_hostname
     }
 
-    fn net_identifiers(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = EthereumNetworkIdentifier, Error = Error> + Send> {
-        let logger = logger.clone();
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    async fn net_identifiers(&self) -> Result<EthereumNetworkIdentifier, Error> {
+        let logger = self.logger.clone();
 
         let web3 = self.web3.clone();
         let net_version_future = retry("net_version RPC call", &logger)
@@ -635,34 +645,34 @@ where
             .timeout_secs(30)
             .run(move || {
                 web3.eth()
-                    .block(BlockId::Number(BlockNumber::Number(0.into())))
+                    .block(BlockId::Number(Web3BlockNumber::Number(0.into())))
                     .from_err()
                     .and_then(|gen_block_opt| {
                         future::result(
                             gen_block_opt
                                 .and_then(|gen_block| gen_block.hash)
                                 .ok_or_else(|| {
-                                    format_err!("Ethereum node could not find genesis block")
+                                    anyhow!("Ethereum node could not find genesis block")
                                 }),
                         )
                     })
             });
 
-        Box::new(
-            net_version_future
-                .join(gen_block_hash_future)
-                .map(
-                    |(net_version, genesis_block_hash)| EthereumNetworkIdentifier {
-                        net_version,
-                        genesis_block_hash,
-                    },
-                )
-                .map_err(|e| {
-                    e.into_inner().unwrap_or_else(|| {
-                        format_err!("Ethereum node took too long to read network identifiers")
-                    })
-                }),
-        )
+        net_version_future
+            .join(gen_block_hash_future)
+            .compat()
+            .await
+            .map(
+                |(net_version, genesis_block_hash)| EthereumNetworkIdentifier {
+                    net_version,
+                    genesis_block_hash,
+                },
+            )
+            .map_err(|e| {
+                e.into_inner().unwrap_or_else(|| {
+                    anyhow!("Ethereum node took too long to read network identifiers")
+                })
+            })
     }
 
     fn latest_block_header(
@@ -677,18 +687,18 @@ where
                 .timeout_secs(*JSON_RPC_TIMEOUT)
                 .run(move || {
                     web3.eth()
-                        .block(BlockNumber::Latest.into())
-                        .map_err(|e| format_err!("could not get latest block from Ethereum: {}", e))
+                        .block(Web3BlockNumber::Latest.into())
+                        .map_err(|e| anyhow!("could not get latest block from Ethereum: {}", e))
                         .from_err()
                         .and_then(|block_opt| {
                             block_opt.ok_or_else(|| {
-                                format_err!("no latest block returned from Ethereum").into()
+                                anyhow!("no latest block returned from Ethereum").into()
                             })
                         })
                 })
                 .map_err(move |e| {
                     e.into_inner().unwrap_or_else(move || {
-                        format_err!("Ethereum node took too long to return latest block").into()
+                        anyhow!("Ethereum node took too long to return latest block").into()
                     })
                 }),
         )
@@ -707,18 +717,18 @@ where
                 .timeout_secs(*JSON_RPC_TIMEOUT)
                 .run(move || {
                     web3.eth()
-                        .block_with_txs(BlockNumber::Latest.into())
-                        .map_err(|e| format_err!("could not get latest block from Ethereum: {}", e))
+                        .block_with_txs(Web3BlockNumber::Latest.into())
+                        .map_err(|e| anyhow!("could not get latest block from Ethereum: {}", e))
                         .from_err()
                         .and_then(|block_opt| {
                             block_opt.ok_or_else(|| {
-                                format_err!("no latest block returned from Ethereum").into()
+                                anyhow!("no latest block returned from Ethereum").into()
                             })
                         })
                 })
                 .map_err(move |e| {
                     e.into_inner().unwrap_or_else(move || {
-                        format_err!("Ethereum node took too long to return latest block").into()
+                        anyhow!("Ethereum node took too long to return latest block").into()
                     })
                 }),
         )
@@ -733,7 +743,7 @@ where
             self.block_by_hash(&logger, block_hash)
                 .and_then(move |block_opt| {
                     block_opt.ok_or_else(move || {
-                        format_err!(
+                        anyhow!(
                             "Ethereum node could not find block with hash {}",
                             block_hash
                         )
@@ -761,7 +771,7 @@ where
                 })
                 .map_err(move |e| {
                     e.into_inner().unwrap_or_else(move || {
-                        format_err!("Ethereum node took too long to return block {}", block_hash)
+                        anyhow!("Ethereum node took too long to return block {}", block_hash)
                     })
                 }),
         )
@@ -770,7 +780,7 @@ where
     fn block_by_number(
         &self,
         logger: &Logger,
-        block_number: u64,
+        block_number: BlockNumber,
     ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send> {
         let web3 = self.web3.clone();
         let logger = logger.clone();
@@ -786,7 +796,7 @@ where
                 })
                 .map_err(move |e| {
                     e.into_inner().unwrap_or_else(move || {
-                        format_err!(
+                        anyhow!(
                             "Ethereum node took too long to return block {}",
                             block_number
                         )
@@ -905,7 +915,7 @@ where
                 })
                 .map_err(move |e| {
                     e.into_inner().unwrap_or_else(move || {
-                        format_err!(
+                        anyhow!(
                             "Ethereum node took too long to return receipts for block {}",
                             block_hash
                         )
@@ -919,7 +929,7 @@ where
         &self,
         logger: &Logger,
         chain_store: Arc<dyn ChainStore>,
-        block_number: u64,
+        block_number: BlockNumber,
     ) -> Box<dyn Future<Item = EthereumBlockPointer, Error = EthereumAdapterError> + Send> {
         Box::new(
             // When this method is called (from the subgraph registrar), we don't
@@ -928,17 +938,14 @@ where
             self.block_hash_by_block_number(logger, chain_store.clone(), block_number, false)
                 .and_then(move |block_hash_opt| {
                     block_hash_opt.ok_or_else(|| {
-                        format_err!(
+                        anyhow!(
                             "Ethereum node could not find start block hash by block number {}",
                             &block_number
                         )
                     })
                 })
                 .from_err()
-                .map(move |block_hash| EthereumBlockPointer {
-                    hash: block_hash,
-                    number: block_number,
-                }),
+                .map(move |block_hash| EthereumBlockPointer::from((block_hash, block_number))),
         )
     }
 
@@ -946,7 +953,7 @@ where
         &self,
         logger: &Logger,
         chain_store: Arc<dyn ChainStore>,
-        block_number: u64,
+        block_number: BlockNumber,
         block_is_final: bool,
     ) -> Box<dyn Future<Item = Option<H256>, Error = Error> + Send> {
         let web3 = self.web3.clone();
@@ -1002,7 +1009,7 @@ where
                     .inspect(confirm_block_hash)
                     .map_err(move |e| {
                         e.into_inner().unwrap_or_else(move || {
-                            format_err!(
+                            anyhow!(
                                 "Ethereum node took too long to return data for block #{}",
                                 block_number
                             )
@@ -1020,7 +1027,7 @@ where
         let block_hash = match block.hash {
             Some(hash) => hash,
             None => {
-                return Box::new(future::result(Err(format_err!(
+                return Box::new(future::result(Err(anyhow!(
                     "could not get uncle for block '{}' because block has null hash",
                     block
                         .number
@@ -1042,7 +1049,7 @@ where
                         web3.eth()
                             .uncle(block_hash.clone().into(), index.into())
                             .map_err(move |e| {
-                                format_err!(
+                                anyhow!(
                                     "could not get uncle {} for block {:?} ({} uncles): {}",
                                     index,
                                     block_hash,
@@ -1053,7 +1060,7 @@ where
                     })
                     .map_err(move |e| {
                         e.into_inner().unwrap_or_else(move || {
-                            format_err!("Ethereum node took too long to return uncle")
+                            anyhow!("Ethereum node took too long to return uncle")
                         })
                     })
             }))
@@ -1073,9 +1080,9 @@ where
                 .and_then(move |block_hash_opt| {
                     block_hash_opt
                         .ok_or_else(|| {
-                            format_err!("Ethereum node is missing block #{}", block_ptr.number)
+                            anyhow!("Ethereum node is missing block #{}", block_ptr.number)
                         })
-                        .map(|block_hash| block_hash == block_ptr.hash)
+                        .map(|block_hash| block_hash == block_ptr.hash_as_h256())
                 }),
         )
     }
@@ -1084,7 +1091,7 @@ where
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        block_number: u64,
+        block_number: BlockNumber,
         block_hash: H256,
     ) -> Box<dyn Future<Item = Vec<EthereumCall>, Error = Error> + Send> {
         let eth = self.clone();
@@ -1103,7 +1110,7 @@ where
                 // includes a trace for the block reward which every block should have.
                 // If there are no traces something has gone wrong.
                 if traces.is_empty() {
-                    return future::err(format_err!(
+                    return future::err(anyhow!(
                         "Trace stream returned no traces for block: number = `{}`, hash = `{}`",
                         block_number,
                         block_hash,
@@ -1114,7 +1121,7 @@ where
                 // block hash for the traces is equal to the desired block hash.
                 // Assume all traces are for the same block.
                 if traces.iter().nth(0).unwrap().block_hash != block_hash {
-                    return future::err(format_err!(
+                    return future::err(anyhow!(
                         "Trace stream returned traces for an unexpected block: \
                          number = `{}`, hash = `{}`",
                         block_number,
@@ -1136,8 +1143,8 @@ where
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         log_filter: EthereumLogFilter,
     ) -> DynTryFuture<'static, Vec<Log>, Error> {
         let eth: Self = self.cheap_clone();
@@ -1162,8 +1169,8 @@ where
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         call_filter: EthereumCallFilter,
     ) -> Box<dyn Stream<Item = EthereumCall, Error = Error> + Send> {
         let eth = self.clone();
@@ -1176,6 +1183,13 @@ where
             .collect::<HashSet<H160>>()
             .into_iter()
             .collect::<Vec<H160>>();
+
+        if addresses.is_empty() {
+            // The filter has no started data sources in the requested range, nothing to do.
+            // This prevents an expensive call to `trace_filter` with empty `addresses`.
+            return Box::new(stream::empty());
+        }
+
         Box::new(
             eth.trace_stream(&logger, subgraph_metrics, from, to, addresses)
                 .filter_map(|trace| EthereumCall::try_from_trace(&trace))
@@ -1225,7 +1239,7 @@ where
         // Check if we have it cached, if not do the call and cache.
         Box::new(
             match cache
-                .get_call(call.address, &call_data, call.block_ptr)
+                .get_call(call.address, &call_data, call.block_ptr.clone())
                 .map_err(|e| error!(logger, "call cache get error"; "error" => e.to_string()))
                 .ok()
                 .flatten()
@@ -1242,7 +1256,7 @@ where
                             logger.clone(),
                             call.address,
                             Bytes(call_data.clone()),
-                            call.block_ptr,
+                            call.block_ptr.clone(),
                         )
                         .map(move |result| {
                             let _ = cache
@@ -1314,8 +1328,8 @@ where
     fn block_range_to_ptrs(
         &self,
         logger: Logger,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
     ) -> Box<dyn Future<Item = Vec<EthereumBlockPointer>, Error = Error> + Send> {
         // Currently we can't go to the DB for this because there might be duplicate entries for
         // the same block number.

@@ -1,24 +1,28 @@
-use failure::Error;
 use futures::stream::poll_fn;
 use futures::{Async, Future, Poll, Stream};
+use graphql_parser::schema as s;
 use lazy_static::lazy_static;
 use mockall::predicate::*;
 use mockall::*;
 use serde::{Deserialize, Serialize};
 use stable_hash::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use web3::types::{Address, H256};
 
-use crate::data::store::*;
-use crate::data::subgraph::schema::*;
+use crate::data::subgraph::status;
+use crate::data::{query::QueryTarget, subgraph::schema::*};
+use crate::data::{store::*, subgraph::Source};
 use crate::prelude::*;
 use crate::util::lfu_cache::LfuCache;
+
+use crate::components::server::index_node::VersionInfo;
 
 lazy_static! {
     pub static ref SUBSCRIPTION_THROTTLE_INTERVAL: Duration =
@@ -31,6 +35,57 @@ lazy_static! {
             .unwrap_or_else(|| Duration::from_millis(1000));
 }
 
+/// The type name of an entity. This is the string that is used in the
+/// subgraph's GraphQL schema as `type NAME @entity { .. }`
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntityType(String);
+
+impl EntityType {
+    /// Construct a new entity type. Ideally, this is only called when
+    /// `entity_type` either comes from the GraphQL schema, or from
+    /// the database from fields that are known to contain a valid entity type
+    pub fn new(entity_type: String) -> Self {
+        Self(entity_type)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for EntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'a> From<&s::ObjectType<'a, String>> for EntityType {
+    fn from(object_type: &s::ObjectType<'a, String>) -> Self {
+        EntityType::new(object_type.name.to_owned())
+    }
+}
+
+impl<'a> From<&s::InterfaceType<'a, String>> for EntityType {
+    fn from(interface_type: &s::InterfaceType<'a, String>) -> Self {
+        EntityType::new(interface_type.name.to_owned())
+    }
+}
+
+// This conversion should only be used in tests since it makes it too
+// easy to convert random strings into entity types
+#[cfg(debug_assertions)]
+impl From<&str> for EntityType {
+    fn from(s: &str) -> Self {
+        EntityType::new(s.to_owned())
+    }
+}
+
+impl CheapClone for EntityType {}
+
 // Note: Do not modify fields without making a backward compatible change to
 // the StableHash impl (below)
 /// Key by which an individual entity in the store can be accessed.
@@ -40,7 +95,7 @@ pub struct EntityKey {
     pub subgraph_id: SubgraphDeploymentId,
 
     /// Name of the entity type.
-    pub entity_type: String,
+    pub entity_type: EntityType,
 
     /// ID of the individual entity.
     pub entity_id: String,
@@ -51,10 +106,40 @@ impl StableHash for EntityKey {
         self.subgraph_id
             .stable_hash(sequence_number.next_child(), state);
         self.entity_type
+            .as_str()
             .stable_hash(sequence_number.next_child(), state);
         self.entity_id
             .stable_hash(sequence_number.next_child(), state);
     }
+}
+
+impl EntityKey {
+    pub fn data(subgraph_id: SubgraphDeploymentId, entity_type: String, entity_id: String) -> Self {
+        Self {
+            subgraph_id,
+            entity_type: EntityType::new(entity_type),
+            entity_id,
+        }
+    }
+}
+
+#[test]
+fn key_stable_hash() {
+    use stable_hash::crypto::SetHasher;
+    use stable_hash::utils::stable_hash;
+
+    #[track_caller]
+    fn hashes_to(key: &EntityKey, exp: &str) {
+        let hash = hex::encode(stable_hash::<SetHasher, _>(&key));
+        assert_eq!(exp, hash.as_str());
+    }
+
+    let id = SubgraphDeploymentId::new("QmP9MRvVzwHxr3sGvujihbvJzcTz2LYLMfi5DyihBg6VUd").unwrap();
+    let key = EntityKey::data(id.clone(), "Account".to_string(), "0xdeadbeef".to_string());
+    hashes_to(
+        &key,
+        "905b57035d6f98cff8281e7b055e10570a2bd31190507341c6716af2d3c1ad98",
+    );
 }
 
 /// Supported types of store filters.
@@ -217,7 +302,7 @@ pub enum EntityLink {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityWindow {
     /// The entity type for this window
-    pub child_type: String,
+    pub child_type: EntityType,
     /// The ids of parents that should be considered for this window
     pub ids: Vec<String>,
     /// How to get the parent id
@@ -232,7 +317,7 @@ pub struct EntityWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityCollection {
     /// Use all entities of the given types
-    All(Vec<String>),
+    All(Vec<EntityType>),
     /// Use entities according to the windows. The set of entities that we
     /// apply order and range to is formed by taking all entities matching
     /// the window, and grouping them by the attribute of the window. Entities
@@ -370,45 +455,45 @@ pub enum EntityChangeOperation {
 
 /// Entity change events emitted by [Store](trait.Store.html) implementations.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct EntityChange {
-    /// ID of the subgraph the changed entity belongs to.
-    pub subgraph_id: SubgraphDeploymentId,
-    /// Entity type name of the changed entity.
-    pub entity_type: String,
-    /// ID of the changed entity.
-    pub entity_id: String,
-    /// Operation that caused the change.
-    pub operation: EntityChangeOperation,
+pub enum EntityChange {
+    Data {
+        subgraph_id: SubgraphDeploymentId,
+        /// Entity type name of the changed entity.
+        entity_type: EntityType,
+    },
+    Assignment {
+        subgraph_id: SubgraphDeploymentId,
+        operation: EntityChangeOperation,
+    },
 }
 
 impl EntityChange {
-    pub fn from_key(key: EntityKey, operation: EntityChangeOperation) -> Self {
-        Self {
+    pub fn for_data(key: EntityKey) -> Self {
+        Self::Data {
             subgraph_id: key.subgraph_id,
             entity_type: key.entity_type,
-            entity_id: key.entity_id,
+        }
+    }
+
+    pub fn for_assignment(
+        subgraph_id: SubgraphDeploymentId,
+        operation: EntityChangeOperation,
+    ) -> Self {
+        Self::Assignment {
+            subgraph_id,
             operation,
         }
     }
 
-    pub fn subgraph_entity_pair(&self) -> SubgraphEntityPair {
-        (self.subgraph_id.clone(), self.entity_type.clone())
-    }
-}
-
-impl From<MetadataOperation> for Option<EntityChange> {
-    fn from(operation: MetadataOperation) -> Self {
-        use self::MetadataOperation::*;
-        match operation {
-            Set { entity, id, .. } | Update { entity, id, .. } => Some(EntityChange::from_key(
-                MetadataOperation::entity_key(entity, id),
-                EntityChangeOperation::Set,
-            )),
-            Remove { entity, id, .. } => Some(EntityChange::from_key(
-                MetadataOperation::entity_key(entity, id),
-                EntityChangeOperation::Removed,
-            )),
-            AbortUnless { .. } => None,
+    pub fn as_filter(&self) -> SubscriptionFilter {
+        use EntityChange::*;
+        match self {
+            Data {
+                subgraph_id,
+                entity_type,
+                ..
+            } => SubscriptionFilter::Entities(subgraph_id.clone(), entity_type.clone()),
+            Assignment { .. } => SubscriptionFilter::Assignment,
         }
     }
 }
@@ -429,13 +514,6 @@ pub struct StoreEvent {
     pub changes: HashSet<EntityChange>,
 }
 
-impl From<Vec<MetadataOperation>> for StoreEvent {
-    fn from(operations: Vec<MetadataOperation>) -> Self {
-        let changes: Vec<_> = operations.into_iter().filter_map(|op| op.into()).collect();
-        StoreEvent::new(changes)
-    }
-}
-
 impl<'a> FromIterator<&'a EntityModification> for StoreEvent {
     fn from_iter<I: IntoIterator<Item = &'a EntityModification>>(mods: I) -> Self {
         let changes: Vec<_> = mods
@@ -443,11 +521,8 @@ impl<'a> FromIterator<&'a EntityModification> for StoreEvent {
             .map(|op| {
                 use self::EntityModification::*;
                 match op {
-                    Insert { key, .. } | Overwrite { key, .. } => {
-                        EntityChange::from_key(key.clone(), EntityChangeOperation::Set)
-                    }
-                    Remove { key } => {
-                        EntityChange::from_key(key.clone(), EntityChangeOperation::Removed)
+                    Insert { key, .. } | Overwrite { key, .. } | Remove { key } => {
+                        EntityChange::for_data(key.clone())
                     }
                 }
             })
@@ -534,15 +609,12 @@ where
     /// Filter a `StoreEventStream` by subgraph and entity. Only events that have
     /// at least one change to one of the given (subgraph, entity) combinations
     /// will be delivered by the filtered stream.
-    pub fn filter_by_entities(self, entities: Vec<SubgraphEntityPair>) -> StoreEventStreamBox {
+    pub fn filter_by_entities(self, filters: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
         let source = self.source.filter(move |event| {
-            event.changes.iter().any({
-                |change| {
-                    entities.iter().any(|(subgraph_id, entity_type)| {
-                        subgraph_id == &change.subgraph_id && entity_type == &change.entity_type
-                    })
-                }
-            })
+            event
+                .changes
+                .iter()
+                .any(|change| filters.iter().any(|filter| filter.matches(change)))
         });
 
         StoreEventStream::new(Box::new(source))
@@ -570,14 +642,9 @@ where
         // bit longer than we really should
         static SYNC_REFRESH_FREQ: u32 = 4;
 
-        // Check whether a deployment is marked as synced in the store. The
-        // special 'subgraphs' subgraph is never considered synced so that
-        // we always throttle it
+        // Check whether a deployment is marked as synced in the store
         let check_synced = |store: &dyn QueryStore, deployment: &SubgraphDeploymentId| {
-            deployment != &*SUBGRAPHS_ID
-                && store
-                    .is_deployment_synced(deployment.clone())
-                    .unwrap_or(false)
+            store.is_deployment_synced(deployment).unwrap_or(false)
         };
         let mut synced = check_synced(&*store, &deployment);
         let synced_check_interval = interval.checked_mul(SYNC_REFRESH_FREQ).unwrap();
@@ -586,7 +653,7 @@ where
         let mut pending_event: Option<StoreEvent> = None;
         let mut source = self.source.fuse();
         let mut had_err = false;
-        let mut delay = tokio::time::delay_for(interval).unit_error().compat();
+        let mut delay = tokio::time::sleep(interval).unit_error().boxed().compat();
         let logger = logger.clone();
 
         let source = Box::new(poll_fn(move || -> Poll<Option<Arc<StoreEvent>>, ()> {
@@ -613,7 +680,7 @@ where
                 // Timer errors are harmless. Treat them as if the timer had
                 // become ready.
                 Ok(Async::Ready(())) | Err(_) => {
-                    delay = tokio::time::delay_for(interval).unit_error().compat();
+                    delay = tokio::time::sleep(interval).unit_error().boxed().compat();
                     true
                 }
             };
@@ -665,106 +732,62 @@ pub enum EntityOperation {
     Remove { key: EntityKey },
 }
 
-/// An operation on subgraph metadata. All operations implicitly only concern
-/// the subgraph of subgraphs.
-#[derive(Clone, Debug)]
-pub enum MetadataOperation {
-    /// Locates the entity with type `entity` and the given `id` in the
-    /// subgraph of subgraphs and sets its attributes according to the
-    /// contents of `data`.  If no such entity exists, creates a new entity.
-    Set {
-        entity: MetadataType,
-        id: String,
-        data: Entity,
-    },
-
-    /// Removes an entity with the specified entity type and id if one exists.
-    Remove { entity: MetadataType, id: String },
-
-    /// Aborts and rolls back the transaction unless `query` returns entities
-    /// exactly matching `entity_ids`. The equality test is only sensitive
-    /// to the order of the results if `query` contains an `order_by`.
-    AbortUnless {
-        description: String, // Programmer-friendly debug message to explain reason for abort
-        metadata_type: MetadataType,
-        filter: EntityFilter,
-        entity_ids: Vec<String>, // What entities the query should return
-    },
-
-    /// Update an entity. The `data` should only contain the attributes that
-    /// need to be changed, not the entire entity. The update will only happen
-    /// if the given entity matches `guard` when the update is made. `Update`
-    /// provides a way to atomically do a check-and-set change to an entity.
-    Update {
-        entity: MetadataType,
-        id: String,
-        data: Entity,
-    },
-}
-
-impl MetadataOperation {
-    pub fn entity_key(entity: MetadataType, id: String) -> EntityKey {
-        EntityKey {
-            subgraph_id: SUBGRAPHS_ID.clone(),
-            entity_type: entity.to_string(),
-            entity_id: id,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AttributeIndexDefinition {
-    pub subgraph_id: SubgraphDeploymentId,
-    pub entity_number: usize,
-    pub attribute_number: usize,
-    pub field_value_type: ValueType,
-    pub attribute_name: String,
-    pub entity_name: String,
-}
-
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum StoreError {
-    #[fail(display = "store transaction failed, need to retry: {}", _0)]
-    Aborted(TransactionAbortError),
-    #[fail(display = "store error: {}", _0)]
+    #[error("store error: {0}")]
     Unknown(Error),
-    #[fail(
-        display = "tried to set entity of type `{}` with ID \"{}\" but an entity of type `{}`, \
-                   which has an interface in common with `{}`, exists with the same ID",
-        _0, _1, _2, _0
+    #[error(
+        "tried to set entity of type `{0}` with ID \"{1}\" but an entity of type `{2}`, \
+         which has an interface in common with `{0}`, exists with the same ID"
     )]
     ConflictingId(String, String, String), // (entity, id, conflicting_entity)
-    #[fail(display = "unknown field '{}'", _0)]
+    #[error("unknown field '{0}'")]
     UnknownField(String),
-    #[fail(display = "unknown table '{}'", _0)]
+    #[error("unknown table '{0}'")]
     UnknownTable(String),
-    #[fail(display = "malformed directive '{}'", _0)]
+    #[error("malformed directive '{0}'")]
     MalformedDirective(String),
-    #[fail(display = "query execution failed: {}", _0)]
+    #[error("query execution failed: {0}")]
     QueryExecutionError(String),
-    #[fail(display = "invalid identifier: {}", _0)]
+    #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
-    #[fail(
-        display = "subgraph `{}` has already processed block `{}`; \
-                   there are most likely two (or more) nodes indexing this subgraph",
-        _0, _1
+    #[error(
+        "subgraph `{0}` has already processed block `{1}`; \
+         there are most likely two (or more) nodes indexing this subgraph"
     )]
-    DuplicateBlockProcessing(SubgraphDeploymentId, u64),
+    DuplicateBlockProcessing(SubgraphDeploymentId, BlockNumber),
     /// An internal error where we expected the application logic to enforce
     /// some constraint, e.g., that subgraph names are unique, but found that
     /// constraint to not hold
-    #[fail(display = "internal constraint violated: {}", _0)]
+    #[error("internal constraint violated: {0}")]
     ConstraintViolation(String),
+    #[error("deployment not found: {0}")]
+    DeploymentNotFound(String),
+    #[error("shard not found: {0} (this usually indicates a misconfiguration)")]
+    UnknownShard(String),
+    #[error("Fulltext search not yet deterministic")]
+    FulltextSearchNonDeterministic,
 }
 
-impl From<TransactionAbortError> for StoreError {
-    fn from(e: TransactionAbortError) -> Self {
-        StoreError::Aborted(e)
-    }
+// Convenience to report a constraint violation
+#[macro_export]
+macro_rules! constraint_violation {
+    ($msg:expr) => {{
+        StoreError::ConstraintViolation(format!("{}", $msg))
+    }};
+    ($fmt:expr, $($arg:tt)*) => {{
+        StoreError::ConstraintViolation(format!($fmt, $($arg)*))
+    }}
 }
 
 impl From<::diesel::result::Error> for StoreError {
     fn from(e: ::diesel::result::Error) -> Self {
+        StoreError::Unknown(e.into())
+    }
+}
+
+impl From<::diesel::r2d2::PoolError> for StoreError {
+    fn from(e: ::diesel::r2d2::PoolError) -> Self {
         StoreError::Unknown(e.into())
     }
 }
@@ -787,31 +810,46 @@ impl From<QueryExecutionError> for StoreError {
     }
 }
 
-#[derive(Fail, PartialEq, Eq, Debug)]
-pub enum TransactionAbortError {
-    #[fail(
-        display = "AbortUnless triggered abort, expected {:?} but got {:?}: {}",
-        expected_entity_ids, actual_entity_ids, description
-    )]
-    AbortUnless {
-        expected_entity_ids: Vec<String>,
-        actual_entity_ids: Vec<String>,
-        description: String,
-    },
-    #[fail(display = "transaction aborted: {}", _0)]
-    Other(String),
+pub struct StoredDynamicDataSource {
+    pub name: String,
+    pub source: Source,
+    pub context: Option<String>,
+    pub creation_block: Option<BlockNumber>,
+}
+
+impl From<&DataSource> for StoredDynamicDataSource {
+    fn from(ds: &DataSource) -> Self {
+        Self {
+            name: ds.name.clone(),
+            source: ds.source.clone(),
+            context: ds
+                .context
+                .as_ref()
+                .as_ref()
+                .map(|ctx| serde_json::to_string(&ctx).unwrap()),
+            creation_block: ds.creation_block,
+        }
+    }
+}
+
+pub trait SubscriptionManager: Send + Sync + 'static {
+    /// Subscribe to changes for specific subgraphs and entities.
+    ///
+    /// Returns a stream of store events that match the input arguments.
+    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox;
 }
 
 /// Common trait for store implementations.
-pub trait Store: Send + Sync + 'static {
+#[async_trait]
+pub trait SubgraphStore: Send + Sync + 'static {
     /// Get a pointer to the most recently processed block in the subgraph.
     fn block_ptr(
         &self,
-        subgraph_id: SubgraphDeploymentId,
+        subgraph_id: &SubgraphDeploymentId,
     ) -> Result<Option<EthereumBlockPointer>, Error>;
 
     fn supports_proof_of_indexing<'a>(
-        &'a self,
+        self: Arc<Self>,
         subgraph_id: &'a SubgraphDeploymentId,
     ) -> DynTryFuture<'a, bool>;
 
@@ -821,10 +859,10 @@ pub trait Store: Send + Sync + 'static {
     /// Proof of Indexing. Once all subgraphs have been re-deployed the Option
     /// can be removed.
     fn get_proof_of_indexing<'a>(
-        &'a self,
+        self: Arc<Self>,
         subgraph_id: &'a SubgraphDeploymentId,
         indexer: &'a Option<Address>,
-        block_hash: H256,
+        block: EthereumBlockPointer,
     ) -> DynTryFuture<'a, Option<[u8; 32]>>;
 
     /// Looks up an entity using the given store key at the latest block.
@@ -835,8 +873,8 @@ pub trait Store: Send + Sync + 'static {
     fn get_many(
         &self,
         subgraph_id: &SubgraphDeploymentId,
-        ids_for_type: BTreeMap<&str, Vec<&str>>,
-    ) -> Result<BTreeMap<String, Vec<Entity>>, StoreError>;
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
 
     /// Queries the store for entities that match the store query.
     fn find(&self, query: EntityQuery) -> Result<Vec<Entity>, QueryExecutionError>;
@@ -852,319 +890,152 @@ pub trait Store: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`.
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
-    ///
-    /// Return `true` if the subgraph mentioned in `history_event` should have
-    /// its schema migrated at `block_ptr_to`
     fn transact_block_operations(
         &self,
         subgraph_id: SubgraphDeploymentId,
         block_ptr_to: EthereumBlockPointer,
         mods: Vec<EntityModification>,
         stopwatch: StopwatchMetrics,
-    ) -> Result<bool, StoreError>;
-
-    /// Apply the specified metadata operations.
-    fn apply_metadata_operations(
-        &self,
-        operations: Vec<MetadataOperation>,
+        data_sources: Vec<StoredDynamicDataSource>,
+        deterministic_errors: Vec<SubgraphError>,
     ) -> Result<(), StoreError>;
 
-    /// Build indexes for a set of subgraph entity attributes
-    fn build_entity_attribute_indexes(
-        &self,
-        subgraph: &SubgraphDeploymentId,
-        indexes: Vec<AttributeIndexDefinition>,
-    ) -> Result<(), SubgraphAssignmentProviderError>;
-
     /// Revert the entity changes from a single block atomically in the store, and update the
-    /// subgraph block pointer from `block_ptr_from` to `block_ptr_to`.
+    /// subgraph block pointer to `block_ptr_to`.
     ///
-    /// `block_ptr_from` must match the current value of the subgraph block pointer.
-    /// `block_ptr_to` must point to the parent block of `block_ptr_from`.
+    /// `block_ptr_to` must point to the parent block of the subgraph block pointer.
     fn revert_block_operations(
         &self,
         subgraph_id: SubgraphDeploymentId,
-        block_ptr_from: EthereumBlockPointer,
         block_ptr_to: EthereumBlockPointer,
     ) -> Result<(), StoreError>;
 
-    /// Subscribe to changes for specific subgraphs and entities.
-    ///
-    /// Returns a stream of store events that match the input arguments.
-    fn subscribe(&self, entities: Vec<SubgraphEntityPair>) -> StoreEventStreamBox;
-
     /// Find the deployment for the current version of subgraph `name` and
     /// return details about it needed for executing queries
-    fn deployment_state_from_name(&self, name: SubgraphName)
-        -> Result<DeploymentState, StoreError>;
+    async fn deployment_state_from_name(
+        &self,
+        name: SubgraphName,
+    ) -> Result<DeploymentState, StoreError>;
 
     /// Find the deployment for the subgraph deployment `id` and
     /// return details about it needed for executing queries
-    fn deployment_state_from_id(
+    async fn deployment_state_from_id(
         &self,
         id: SubgraphDeploymentId,
     ) -> Result<DeploymentState, StoreError>;
 
-    /// Read all version entities pointing to the specified deployment IDs and
-    /// determine whether they are current or pending in order to produce
-    /// `SubgraphVersionSummary`s.
-    ///
-    /// Returns the version summaries and a sequence of `AbortUnless`
-    /// `MetadataOperation`s, which will abort the transaction if the version
-    /// summaries are out of date by the time the entity operations are applied.
-    fn read_subgraph_version_summaries(
+    /// Set subgraph status to failed with the given error as the cause.
+    async fn fail_subgraph(
         &self,
-        deployment_ids: Vec<SubgraphDeploymentId>,
-    ) -> Result<(Vec<SubgraphVersionSummary>, Vec<MetadataOperation>), Error> {
-        let version_filter = EntityFilter::new_in(
-            "deployment",
-            deployment_ids.iter().map(|id| id.to_string()).collect(),
-        );
-
-        let mut ops = vec![];
-
-        let versions = self.find(SubgraphVersionEntity::query().filter(version_filter.clone()))?;
-        let version_ids = versions
-            .iter()
-            .map(|version_entity| version_entity.id().unwrap())
-            .collect::<Vec<_>>();
-        ops.push(SubgraphVersionEntity::abort_unless(
-            "Same set of subgraph versions must match filter",
-            version_filter,
-            version_ids.clone(),
-        ));
-
-        // Find subgraphs with one of these versions as current or pending
-        let subgraphs_with_version_as_current_or_pending =
-            self.find(SubgraphEntity::query().filter(EntityFilter::Or(vec![
-                EntityFilter::new_in("currentVersion", version_ids.clone()),
-                EntityFilter::new_in("pendingVersion", version_ids.clone()),
-            ])))?;
-        let subgraph_ids_with_version_as_current_or_pending =
-            subgraphs_with_version_as_current_or_pending
-                .iter()
-                .map(|subgraph_entity| subgraph_entity.id().unwrap())
-                .collect::<HashSet<_>>();
-        ops.push(SubgraphEntity::abort_unless(
-            "Same set of subgraphs must have these versions as current or pending",
-            EntityFilter::Or(vec![
-                EntityFilter::new_in("currentVersion", version_ids.clone()),
-                EntityFilter::new_in("pendingVersion", version_ids),
-            ]),
-            subgraph_ids_with_version_as_current_or_pending
-                .into_iter()
-                .collect(),
-        ));
-
-        // Produce summaries, deriving flags from information in subgraph entities
-        let version_summaries =
-            versions
-                .into_iter()
-                .map(|version_entity| {
-                    let version_entity_id = version_entity.id().unwrap();
-                    let version_entity_id_value = Value::String(version_entity_id.clone());
-                    let subgraph_id = version_entity
-                        .get("subgraph")
-                        .unwrap()
-                        .to_owned()
-                        .as_string()
-                        .unwrap();
-
-                    let is_current = subgraphs_with_version_as_current_or_pending.iter().any(
-                        |subgraph_entity| {
-                            if subgraph_entity.get("currentVersion")
-                                == Some(&version_entity_id_value)
-                            {
-                                assert_eq!(subgraph_entity.id().unwrap(), subgraph_id);
-                                true
-                            } else {
-                                false
-                            }
-                        },
-                    );
-                    let is_pending = subgraphs_with_version_as_current_or_pending.iter().any(
-                        |subgraph_entity| {
-                            if subgraph_entity.get("pendingVersion")
-                                == Some(&version_entity_id_value)
-                            {
-                                assert_eq!(subgraph_entity.id().unwrap(), subgraph_id);
-                                true
-                            } else {
-                                false
-                            }
-                        },
-                    );
-
-                    SubgraphVersionSummary {
-                        id: version_entity_id,
-                        subgraph_id,
-                        deployment_id: SubgraphDeploymentId::new(
-                            version_entity
-                                .get("deployment")
-                                .unwrap()
-                                .to_owned()
-                                .as_string()
-                                .unwrap(),
-                        )
-                        .unwrap(),
-                        current: is_current,
-                        pending: is_pending,
-                    }
-                })
-                .collect();
-
-        Ok((version_summaries, ops))
-    }
-
-    /// Produce the MetadataOperations needed to create/remove
-    /// SubgraphDeploymentAssignments to reflect the addition/removal of
-    /// SubgraphVersions between `versions_before` and `versions_after`.
-    /// Any new assignments are created with the specified `node_id`.
-    /// `node_id` can be `None` if it is known that no versions were added.
-    fn reconcile_assignments(
-        &self,
-        logger: &Logger,
-        versions_before: Vec<SubgraphVersionSummary>,
-        versions_after: Vec<SubgraphVersionSummary>,
-        node_id: Option<NodeId>,
-    ) -> Vec<MetadataOperation> {
-        fn should_have_assignment(version: &SubgraphVersionSummary) -> bool {
-            version.pending || version.current
-        }
-
-        let assignments_before = versions_before
-            .into_iter()
-            .filter(should_have_assignment)
-            .map(|v| v.deployment_id)
-            .collect::<HashSet<_>>();
-        let assignments_after = versions_after
-            .into_iter()
-            .filter(should_have_assignment)
-            .map(|v| v.deployment_id)
-            .collect::<HashSet<_>>();
-        let removed_assignments = &assignments_before - &assignments_after;
-        let added_assignments = &assignments_after - &assignments_before;
-
-        let mut ops = vec![];
-
-        if !removed_assignments.is_empty() {
-            debug!(
-                logger,
-                "Removing subgraph node assignments for {} subgraph deployment ID(s) ({})",
-                removed_assignments.len(),
-                removed_assignments
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !added_assignments.is_empty() {
-            debug!(
-                logger,
-                "Adding subgraph node assignments for {} subgraph deployment ID(s) ({})",
-                added_assignments.len(),
-                added_assignments
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-
-        ops.extend(removed_assignments.into_iter().map(|deployment_id| {
-            MetadataOperation::Remove {
-                entity: SubgraphDeploymentAssignmentEntity::TYPENAME,
-                id: deployment_id.to_string(),
-            }
-        }));
-        ops.extend(added_assignments.iter().flat_map(|deployment_id| {
-            SubgraphDeploymentAssignmentEntity::new(
-                node_id
-                    .clone()
-                    .expect("Cannot create new subgraph deployment assignment without node ID"),
-            )
-            .write_operations(deployment_id)
-        }));
-
-        ops
-    }
+        id: SubgraphDeploymentId,
+        error: SubgraphError,
+    ) -> Result<(), StoreError>;
 
     /// Check if the store is accepting queries for the specified subgraph.
     /// May return true even if the specified subgraph is not currently assigned to an indexing
     /// node, as the store will still accept queries.
     fn is_deployed(&self, id: &SubgraphDeploymentId) -> Result<bool, Error> {
-        // The subgraph of subgraphs is always deployed.
-        if id == &*SUBGRAPHS_ID {
-            return Ok(true);
-        }
-
-        // Check store for a deployment entity for this subgraph ID
-        self.get(SubgraphDeploymentEntity::key(id.to_owned()))
-            .map_err(|e| format_err!("Failed to query SubgraphDeployment entities: {}", e))
-            .map(|entity_opt| entity_opt.is_some())
+        self.block_ptr(id).map(|ptr| ptr.is_some())
     }
 
     /// Return true if the deployment with the given id is fully synced,
     /// and return false otherwise. Errors from the store are passed back up
-    fn is_deployment_synced(&self, id: SubgraphDeploymentId) -> Result<bool, Error> {
-        let entity = self.get(SubgraphDeploymentEntity::key(id))?;
-        entity
-            .map(|entity| match entity.get("synced") {
-                Some(Value::Bool(true)) => Ok(true),
-                _ => Ok(false),
-            })
-            .unwrap_or(Ok(false))
-    }
+    fn is_deployment_synced(&self, id: &SubgraphDeploymentId) -> Result<bool, Error>;
 
-    /// Create a new subgraph deployment. The deployment must not exist yet. `ops`
-    /// needs to contain all the operations on subgraphs and subgraph deployments to
-    /// create the deployment, including any assignments as a current or pending
-    /// version
+    /// The deployment `id` finished syncing, mark it as synced in the database
+    /// and promote it to the current version in the subgraphs where it was the
+    /// pending version so far
+    fn deployment_synced(&self, id: &SubgraphDeploymentId) -> Result<(), Error>;
+
+    /// Create a new deployment for the subgraph `name`. If the deployment
+    /// already exists (as identified by the `schema.id`), reuse that, otherwise
+    /// create a new deployment, and point the current or pending version of
+    /// `name` at it, depending on the `mode`
     fn create_subgraph_deployment(
         &self,
+        name: SubgraphName,
         schema: &Schema,
-        ops: Vec<MetadataOperation>,
+        deployment: SubgraphDeploymentEntity,
+        node_id: NodeId,
+        network: String,
+        mode: SubgraphVersionSwitchingMode,
     ) -> Result<(), StoreError>;
 
-    /// Start an existing subgraph deployment. This will reset the state of
-    /// the subgraph to a known good state. `ops` needs to contain all the
-    /// operations on the subgraph of subgraphs to reset the metadata of the
+    /// Create a new subgraph with the given name. If one already exists, use
+    /// the existing one. Return the `id` of the newly created or existing
     /// subgraph
+    fn create_subgraph(&self, name: SubgraphName) -> Result<String, StoreError>;
+
+    /// Remove a subgraph and all its versions; if deployments that were used
+    /// by this subgraph do not need to be indexed anymore, also remove
+    /// their assignment, but keep the deployments themselves around
+    fn remove_subgraph(&self, name: SubgraphName) -> Result<(), StoreError>;
+
+    /// Assign the subgraph with `id` to the node `node_id`. If there is no
+    /// assignment for the given deployment, report an error.
+    fn reassign_subgraph(
+        &self,
+        id: &SubgraphDeploymentId,
+        node_id: &NodeId,
+    ) -> Result<(), StoreError>;
+
+    fn unassign_subgraph(&self, id: &SubgraphDeploymentId) -> Result<(), StoreError>;
+
+    /// Start an existing subgraph deployment.
     fn start_subgraph_deployment(
         &self,
         logger: &Logger,
         subgraph_id: &SubgraphDeploymentId,
-        ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError>;
 
-    /// Try to perform a pending migration for a subgraph schema. Even if a
-    /// subgraph has a pending schema migration, this method might not actually
-    /// perform the migration because of limits on the total number of
-    /// migrations that can happen at the same time across the whole system.
-    ///
-    /// Any errors happening during the migration will be logged as warnings
-    /// on `logger`, but otherwise ignored
-    fn migrate_subgraph_deployment(
-        &self,
-        logger: &Logger,
-        subgraph_id: &SubgraphDeploymentId,
-        block_ptr: &EthereumBlockPointer,
-    );
+    /// Remove the fatal error from a subgraph and check if it is healthy or unhealthy.
+    fn unfail(&self, subgraph_id: &SubgraphDeploymentId) -> Result<(), StoreError>;
 
-    /// Return the number of the block with the given hash for the given
-    /// subgraph
-    fn block_number(
+    /// Load the dynamic data sources for the given deployment
+    async fn load_dynamic_data_sources(
+        &self,
+        subgraph_id: SubgraphDeploymentId,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError>;
+
+    fn assigned_node(
         &self,
         subgraph_id: &SubgraphDeploymentId,
-        block_hash: H256,
-    ) -> Result<Option<BlockNumber>, StoreError>;
+    ) -> Result<Option<NodeId>, StoreError>;
 
+    fn assignments(&self, node: &NodeId) -> Result<Vec<SubgraphDeploymentId>, StoreError>;
+
+    /// Return `true` if a subgraph `name` exists, regardless of whether the
+    /// subgraph has any deployments attached to it
+    fn subgraph_exists(&self, name: &SubgraphName) -> Result<bool, StoreError>;
+
+    /// Return the GraphQL schema supplied by the user
+    fn input_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<Schema>, StoreError>;
+
+    /// Return the GraphQL schema that was derived from the user's schema by
+    /// adding a root query type etc. to it
+    fn api_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<ApiSchema>, StoreError>;
+
+    /// Return the name of the network that the subgraph is indexing from. The
+    /// names returned are things like `mainnet` or `ropsten`
+    fn network_name(&self, subgraph_id: &SubgraphDeploymentId) -> Result<String, StoreError>;
+}
+
+#[async_trait]
+pub trait QueryStoreManager: Send + Sync + 'static {
     /// Get a new `QueryStore`. A `QueryStore` is tied to a DB replica, so if Graph Node is
     /// configured to use secondary DB servers the queries will be distributed between servers.
     ///
+    /// The query store is specific to a deployment, and `id` must indicate
+    /// which deployment will be queried. It is not possible to use the id of the
+    /// metadata subgraph, though the resulting store can be used to query
+    /// metadata about the deployment `id` (but not metadata about other deployments).
+    ///
     /// If `for_subscription` is true, the main replica will always be used.
-    fn query_store(self: Arc<Self>, for_subscription: bool) -> Arc<dyn QueryStore + Send + Sync>;
+    async fn query_store(
+        &self,
+        target: QueryTarget,
+        for_subscription: bool,
+    ) -> Result<Arc<dyn QueryStore + Send + Sync>, QueryExecutionError>;
 }
 
 mock! {
@@ -1172,8 +1043,8 @@ mock! {
         fn get_many_mock<'a>(
             &self,
             _subgraph_id: &SubgraphDeploymentId,
-            _ids_for_type: BTreeMap<&'a str, Vec<&'a str>>,
-        ) -> Result<BTreeMap<String, Vec<Entity>>, StoreError>;
+            _ids_for_type: BTreeMap<&'a EntityType, Vec<&'a str>>,
+        ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
     }
 }
 
@@ -1182,26 +1053,27 @@ mock! {
 pub type PoolWaitStats = Arc<RwLock<MovingStats>>;
 
 // The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
-impl Store for MockStore {
+#[async_trait]
+impl SubgraphStore for MockStore {
     fn block_ptr(
         &self,
-        _subgraph_id: SubgraphDeploymentId,
+        _subgraph_id: &SubgraphDeploymentId,
     ) -> Result<Option<EthereumBlockPointer>, Error> {
         unimplemented!();
     }
 
     fn supports_proof_of_indexing<'a>(
-        &'a self,
+        self: Arc<Self>,
         _subgraph_id: &'a SubgraphDeploymentId,
     ) -> DynTryFuture<'a, bool> {
         unimplemented!();
     }
 
     fn get_proof_of_indexing<'a>(
-        &'a self,
+        self: Arc<Self>,
         _subgraph_id: &'a SubgraphDeploymentId,
         _indexer: &'a Option<Address>,
-        _block_hash: H256,
+        _block: EthereumBlockPointer,
     ) -> DynTryFuture<'a, Option<[u8; 32]>> {
         unimplemented!();
     }
@@ -1213,8 +1085,8 @@ impl Store for MockStore {
     fn get_many(
         &self,
         subgraph_id: &SubgraphDeploymentId,
-        ids_for_type: BTreeMap<&str, Vec<&str>>,
-    ) -> Result<BTreeMap<String, Vec<Entity>>, StoreError> {
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
         self.get_many_mock(subgraph_id, ids_for_type)
     }
 
@@ -1236,54 +1108,67 @@ impl Store for MockStore {
         _block_ptr_to: EthereumBlockPointer,
         _mods: Vec<EntityModification>,
         _stopwatch: StopwatchMetrics,
-    ) -> Result<bool, StoreError> {
-        unimplemented!()
-    }
-
-    fn apply_metadata_operations(
-        &self,
-        _operations: Vec<MetadataOperation>,
+        _data_sources: Vec<StoredDynamicDataSource>,
+        _deterministic_errors: Vec<SubgraphError>,
     ) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn build_entity_attribute_indexes(
-        &self,
-        _subgraph: &SubgraphDeploymentId,
-        _indexes: Vec<AttributeIndexDefinition>,
-    ) -> Result<(), SubgraphAssignmentProviderError> {
         unimplemented!()
     }
 
     fn revert_block_operations(
         &self,
         _subgraph_id: SubgraphDeploymentId,
-        _block_ptr_from: EthereumBlockPointer,
         _block_ptr_to: EthereumBlockPointer,
     ) -> Result<(), StoreError> {
         unimplemented!()
     }
 
-    fn subscribe(&self, _entities: Vec<SubgraphEntityPair>) -> StoreEventStreamBox {
+    async fn deployment_state_from_name(
+        &self,
+        _: SubgraphName,
+    ) -> Result<DeploymentState, StoreError> {
         unimplemented!()
     }
 
-    fn deployment_state_from_name(&self, _: SubgraphName) -> Result<DeploymentState, StoreError> {
-        unimplemented!()
-    }
-
-    fn deployment_state_from_id(
+    async fn deployment_state_from_id(
         &self,
         _: SubgraphDeploymentId,
     ) -> Result<DeploymentState, StoreError> {
         unimplemented!()
     }
 
+    async fn fail_subgraph(
+        &self,
+        _: SubgraphDeploymentId,
+        _: SubgraphError,
+    ) -> Result<(), StoreError> {
+        unimplemented!()
+    }
+
     fn create_subgraph_deployment(
         &self,
-        _schema: &Schema,
-        _ops: Vec<MetadataOperation>,
+        _: SubgraphName,
+        _: &Schema,
+        _: SubgraphDeploymentEntity,
+        _: NodeId,
+        _: String,
+        _: SubgraphVersionSwitchingMode,
     ) -> Result<(), StoreError> {
+        unimplemented!()
+    }
+
+    fn create_subgraph(&self, _: SubgraphName) -> Result<String, StoreError> {
+        unimplemented!()
+    }
+
+    fn remove_subgraph(&self, _: SubgraphName) -> Result<(), StoreError> {
+        unimplemented!()
+    }
+
+    fn reassign_subgraph(&self, _: &SubgraphDeploymentId, _: &NodeId) -> Result<(), StoreError> {
+        unimplemented!()
+    }
+
+    fn unassign_subgraph(&self, _: &SubgraphDeploymentId) -> Result<(), StoreError> {
         unimplemented!()
     }
 
@@ -1291,51 +1176,64 @@ impl Store for MockStore {
         &self,
         _logger: &Logger,
         _subgraph_id: &SubgraphDeploymentId,
-        _ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
         unimplemented!()
     }
 
-    fn migrate_subgraph_deployment(
-        &self,
-        _logger: &Logger,
-        _subgraph_id: &SubgraphDeploymentId,
-        _block_ptr: &EthereumBlockPointer,
-    ) {
+    fn unfail(&self, _: &SubgraphDeploymentId) -> Result<(), StoreError> {
         unimplemented!()
     }
 
-    fn block_number(
-        &self,
-        _subgraph_id: &SubgraphDeploymentId,
-        _block_hash: H256,
-    ) -> Result<Option<BlockNumber>, StoreError> {
+    fn is_deployment_synced(&self, _: &SubgraphDeploymentId) -> Result<bool, Error> {
         unimplemented!()
     }
 
-    fn query_store(self: Arc<Self>, _: bool) -> Arc<dyn QueryStore + Send + Sync> {
+    fn deployment_synced(&self, _: &SubgraphDeploymentId) -> Result<(), Error> {
+        unimplemented!()
+    }
+
+    async fn load_dynamic_data_sources(
+        &self,
+        _subgraph_id: SubgraphDeploymentId,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+        unimplemented!()
+    }
+
+    fn assigned_node(&self, _: &SubgraphDeploymentId) -> Result<Option<NodeId>, StoreError> {
+        unimplemented!()
+    }
+
+    fn assignments(&self, _: &NodeId) -> Result<Vec<SubgraphDeploymentId>, StoreError> {
+        unimplemented!()
+    }
+
+    fn subgraph_exists(&self, _: &SubgraphName) -> Result<bool, StoreError> {
+        unimplemented!()
+    }
+
+    fn input_schema(&self, _: &SubgraphDeploymentId) -> Result<Arc<Schema>, StoreError> {
+        unimplemented!()
+    }
+
+    fn api_schema(&self, _: &SubgraphDeploymentId) -> Result<Arc<ApiSchema>, StoreError> {
+        unimplemented!()
+    }
+
+    fn network_name(&self, _: &SubgraphDeploymentId) -> Result<String, StoreError> {
         unimplemented!()
     }
 }
 
-#[automock]
-pub trait SubgraphDeploymentStore: Send + Sync + 'static {
-    /// Return the GraphQL schema supplied by the user
-    fn input_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<Schema>, Error>;
+pub trait BlockStore: Send + Sync + 'static {
+    type ChainStore: ChainStore;
 
-    /// Return the GraphQL schema that was derived from the user's schema by
-    /// adding a root query type etc. to it
-    fn api_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<ApiSchema>, Error>;
+    fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>>;
+}
 
-    /// Return true if the subgraph uses the relational storage scheme; if
-    /// it is false, the subgraph uses JSONB storage. This method exposes
-    /// store internals that should really be hidden and should be used
-    /// sparingly and only when absolutely needed
-    fn uses_relational_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<bool, Error>;
+pub trait CallCache: Send + Sync + 'static {
+    type EthereumCallCache: EthereumCallCache;
 
-    /// Return the name of the network that the subgraph is indexing from. The
-    /// names returned are things like `mainnet` or `ropsten`
-    fn network_name(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Option<String>, Error>;
+    fn ethereum_call_cache(&self, network: &str) -> Option<Arc<Self::EthereumCallCache>>;
 }
 
 /// Common trait for blockchain store implementations.
@@ -1375,7 +1273,7 @@ pub trait ChainStore: Send + Sync + 'static {
     ///
     /// If the candidate new head block had one or more missing ancestors, returns
     /// `Ok(missing_blocks)`, where `missing_blocks` is a nonexhaustive list of missing blocks.
-    fn attempt_chain_head_update(&self, ancestor_count: u64) -> Result<Vec<H256>, Error>;
+    fn attempt_chain_head_update(&self, ancestor_count: BlockNumber) -> Result<Vec<H256>, Error>;
 
     /// Subscribe to chain head updates.
     fn chain_head_updates(&self) -> ChainHeadUpdateStream;
@@ -1398,7 +1296,7 @@ pub trait ChainStore: Send + Sync + 'static {
     fn ancestor_block(
         &self,
         block_ptr: EthereumBlockPointer,
-        offset: u64,
+        offset: BlockNumber,
     ) -> Result<Option<EthereumBlock>, Error>;
 
     /// Remove old blocks from the cache we maintain in the database and
@@ -1406,14 +1304,20 @@ pub trait ChainStore: Send + Sync + 'static {
     /// and the number of blocks deleted.
     /// We will never remove blocks that are within `ancestor_count` of
     /// the chain head.
-    fn cleanup_cached_blocks(&self, ancestor_count: u64) -> Result<(BlockNumber, usize), Error>;
+    fn cleanup_cached_blocks(
+        &self,
+        ancestor_count: BlockNumber,
+    ) -> Result<(BlockNumber, usize), Error>;
 
     /// Return the hashes of all blocks with the given number
-    fn block_hashes_by_block_number(&self, number: u64) -> Result<Vec<H256>, Error>;
+    fn block_hashes_by_block_number(&self, number: BlockNumber) -> Result<Vec<H256>, Error>;
 
     /// Confirm that block number `number` has hash `hash` and that the store
     /// may purge any other blocks with that number
-    fn confirm_block_hash(&self, number: u64, hash: &H256) -> Result<usize, Error>;
+    fn confirm_block_hash(&self, number: BlockNumber, hash: &H256) -> Result<usize, Error>;
+
+    /// Find the block with `block_hash` and return the network name and number
+    fn block_number(&self, block_hash: H256) -> Result<Option<(String, BlockNumber)>, StoreError>;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {
@@ -1435,16 +1339,74 @@ pub trait EthereumCallCache: Send + Sync + 'static {
     ) -> Result<(), Error>;
 }
 
-/// Store operations used when serving queries
+/// Store operations used when serving queries for a specific deployment
+#[async_trait]
 pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, graphql_parser::query::Value>>, QueryExecutionError>;
+    ) -> Result<Vec<BTreeMap<String, q::Value>>, QueryExecutionError>;
 
-    fn subscribe(&self, entities: Vec<SubgraphEntityPair>) -> StoreEventStreamBox;
+    fn is_deployment_synced(&self, id: &SubgraphDeploymentId) -> Result<bool, Error>;
 
-    fn is_deployment_synced(&self, id: SubgraphDeploymentId) -> Result<bool, Error>;
+    fn block_ptr(
+        &self,
+        subgraph_id: SubgraphDeploymentId,
+    ) -> Result<Option<EthereumBlockPointer>, Error>;
+
+    fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError>;
+
+    fn wait_stats(&self) -> &PoolWaitStats;
+
+    /// If `block` is `None`, assumes the latest block.
+    async fn has_non_fatal_errors(
+        &self,
+        id: SubgraphDeploymentId,
+        block: Option<BlockNumber>,
+    ) -> Result<bool, StoreError>;
+
+    /// Find the current state for the subgraph deployment `id` and
+    /// return details about it needed for executing queries
+    async fn deployment_state(&self) -> Result<DeploymentState, QueryExecutionError>;
+
+    fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError>;
+
+    fn network_name(&self) -> &str;
+}
+
+/// A view of the store that can provide information about the indexing status
+/// of any subgraph and any deployment
+pub trait StatusStore: Send + Sync + 'static {
+    fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
+
+    /// Support for the explorer-specific API
+    fn version_info(&self, version_id: &str) -> Result<VersionInfo, StoreError>;
+
+    /// Support for the explorer-specific API; note that `subgraph_id` must be
+    /// the id of an entry in `subgraphs.subgraph`, not that of a deployment.
+    /// The return values are the ids of the `subgraphs.subgraph_version` for
+    /// the current and pending versions of the subgraph
+    fn versions_for_subgraph_id(
+        &self,
+        subgraph_id: &str,
+    ) -> Result<(Option<String>, Option<String>), StoreError>;
+
+    fn supports_proof_of_indexing<'a>(
+        self: Arc<Self>,
+        subgraph_id: &'a SubgraphDeploymentId,
+    ) -> DynTryFuture<'a, bool>;
+
+    /// A value of None indicates that the table is not available. Re-deploying
+    /// the subgraph fixes this. It is undesirable to force everything to
+    /// re-sync from scratch, so existing deployments will continue without a
+    /// Proof of Indexing. Once all subgraphs have been re-deployed the Option
+    /// can be removed.
+    fn get_proof_of_indexing<'a>(
+        self: Arc<Self>,
+        subgraph_id: &'a SubgraphDeploymentId,
+        indexer: &'a Option<Address>,
+        block: EthereumBlockPointer,
+    ) -> DynTryFuture<'a, Option<[u8; 32]>>;
 }
 
 /// An entity operation that can be transacted into the store; as opposed to
@@ -1468,15 +1430,51 @@ impl EntityModification {
         }
     }
 
-    /// Return `true` if self modifies the metadata subgraph
-    pub fn is_meta(&self) -> bool {
-        self.entity_key().subgraph_id.is_meta()
-    }
-
     pub fn is_remove(&self) -> bool {
         match self {
             EntityModification::Remove { .. } => true,
             _ => false,
+        }
+    }
+}
+
+/// A representation of entity operations that can be accumulated.
+#[derive(Debug, Clone)]
+enum EntityOp {
+    Remove,
+    Update(Entity),
+    Overwrite(Entity),
+}
+
+impl EntityOp {
+    fn apply_to(self, entity: Option<Entity>) -> Option<Entity> {
+        use EntityOp::*;
+        match (self, entity) {
+            (Remove, _) => None,
+            (Overwrite(new), _) | (Update(new), None) => Some(new),
+            (Update(updates), Some(mut entity)) => {
+                entity.merge_remove_null_fields(updates);
+                Some(entity)
+            }
+        }
+    }
+
+    fn accumulate(&mut self, next: EntityOp) {
+        use EntityOp::*;
+        let update = match next {
+            // Remove and Overwrite ignore the current value.
+            Remove | Overwrite(_) => {
+                *self = next;
+                return;
+            }
+            Update(update) => update,
+        };
+
+        // We have an update, apply it.
+        match self {
+            // This is how `Overwrite` is constructed, by accumulating `Update` onto `Remove`.
+            Remove => *self = Overwrite(update),
+            Update(current) | Overwrite(current) => current.merge(update),
         }
     }
 }
@@ -1488,17 +1486,24 @@ impl EntityModification {
 ///   (1) no entity appears in more than one operation
 ///   (2) only entities that will actually be changed from what they
 ///       are in the store are changed
-#[derive(Clone)]
 pub struct EntityCache {
     /// The state of entities in the store. An entry of `None`
     /// means that the entity is not present in the store
     current: LfuCache<EntityKey, Option<Entity>>,
 
-    /// The accumulated changes to an entity. An entry of `None`
-    /// means that the entity should be deleted
-    updates: BTreeMap<EntityKey, Option<Entity>>,
+    /// The accumulated changes to an entity.
+    updates: HashMap<EntityKey, EntityOp>,
 
-    pub store: Arc<dyn Store>,
+    // Updates for a currently executing handler.
+    handler_updates: HashMap<EntityKey, EntityOp>,
+
+    // Marks whether updates should go in `handler_updates`.
+    in_handler: bool,
+
+    data_sources: Vec<StoredDynamicDataSource>,
+
+    /// The store is only used to read entities.
+    pub store: Arc<dyn SubgraphStore>,
 }
 
 impl Debug for EntityCache {
@@ -1512,106 +1517,121 @@ impl Debug for EntityCache {
 
 pub struct ModificationsAndCache {
     pub modifications: Vec<EntityModification>,
+    pub data_sources: Vec<StoredDynamicDataSource>,
     pub entity_lfu_cache: LfuCache<EntityKey, Option<Entity>>,
 }
 
 impl EntityCache {
-    pub fn new(store: Arc<dyn Store>) -> Self {
+    pub fn new(store: Arc<dyn SubgraphStore>) -> Self {
         Self {
             current: LfuCache::new(),
-            updates: BTreeMap::new(),
+            updates: HashMap::new(),
+            handler_updates: HashMap::new(),
+            in_handler: false,
+            data_sources: vec![],
             store,
         }
     }
 
     pub fn with_current(
-        store: Arc<dyn Store>,
+        store: Arc<dyn SubgraphStore>,
         current: LfuCache<EntityKey, Option<Entity>>,
     ) -> EntityCache {
         EntityCache {
             current,
-            updates: BTreeMap::new(),
+            updates: HashMap::new(),
+            handler_updates: HashMap::new(),
+            in_handler: false,
+            data_sources: vec![],
             store,
         }
     }
 
-    pub fn get(&mut self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
-        let current = self.current.get_entity(&*self.store, &key)?;
-        let updates = self.updates.get(&key).cloned();
-        match (current, updates) {
-            // Entity is unchanged
-            (current, None) => Ok(current),
-            // Entity was deleted
-            (_, Some(None)) => Ok(None),
-            // Entity created
-            (None, Some(updates)) => Ok(updates),
-            // Entity updated
-            (Some(current), Some(Some(updates))) => {
-                let mut current = current;
-                current.merge_remove_null_fields(updates);
-                Ok(Some(current))
-            }
+    pub(crate) fn enter_handler(&mut self) {
+        assert!(!self.in_handler);
+        self.in_handler = true;
+    }
+
+    pub(crate) fn exit_handler(&mut self) {
+        assert!(self.in_handler);
+        self.in_handler = false;
+
+        // Apply all handler updates to the main `updates`.
+        let handler_updates = Vec::from_iter(self.handler_updates.drain());
+        for (key, op) in handler_updates {
+            self.entity_op(key, op)
         }
+    }
+
+    pub(crate) fn exit_handler_and_discard_changes(&mut self) {
+        assert!(self.in_handler);
+        self.in_handler = false;
+        self.handler_updates.clear();
+    }
+
+    pub fn get(&mut self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
+        // Get the current entity, apply any updates from `updates`, then from `handler_updates`.
+        let mut entity = self.current.get_entity(&*self.store, &key)?;
+        if let Some(op) = self.updates.get(&key).cloned() {
+            entity = op.apply_to(entity)
+        }
+        if let Some(op) = self.handler_updates.get(&key).cloned() {
+            entity = op.apply_to(entity)
+        }
+        Ok(entity)
     }
 
     pub fn remove(&mut self, key: EntityKey) {
-        self.updates.insert(key, None);
+        self.entity_op(key, EntityOp::Remove);
     }
 
-    pub fn set(&mut self, key: EntityKey, mut entity: Entity) -> Result<(), QueryExecutionError> {
-        use std::collections::btree_map::Entry;
-
-        let update = self.updates.entry(key.clone());
-
-        match update {
-            // First change.
-            Entry::Vacant(entry) => {
-                entry.insert(Some(entity));
-            }
-
-            // Previously changed.
-            Entry::Occupied(mut entry) => match entry.get_mut() {
-                Some(prev_update) => prev_update.merge(entity),
-
-                // Previous change was a removal, clear fields in `current`.
-                None => {
-                    if let Some(current) = self.current.get_entity(&*self.store, &key)? {
-                        // Entity was removed so the fields not updated need to be unset.
-                        for field in current.keys().cloned() {
-                            entity.entry(field).or_insert(Value::Null);
-                        }
-                    }
-
-                    entry.insert(Some(entity));
-                }
-            },
-        }
-        Ok(())
+    pub fn set(&mut self, key: EntityKey, entity: Entity) {
+        self.entity_op(key, EntityOp::Update(entity))
     }
 
-    pub fn append(&mut self, operations: Vec<EntityOperation>) -> Result<(), QueryExecutionError> {
+    pub fn append(&mut self, operations: Vec<EntityOperation>) {
+        assert!(!self.in_handler);
+
         for operation in operations {
             match operation {
                 EntityOperation::Set { key, data } => {
-                    self.set(key, data)?;
+                    self.entity_op(key, EntityOp::Update(data));
                 }
                 EntityOperation::Remove { key } => {
-                    self.remove(key);
+                    self.entity_op(key, EntityOp::Remove);
                 }
             }
         }
-        Ok(())
     }
 
-    pub fn extend(&mut self, other: EntityCache) -> Result<(), QueryExecutionError> {
-        self.current.extend(other.current);
-        for (key, update) in other.updates {
-            match update {
-                Some(update) => self.set(key, update)?,
-                None => self.remove(key),
+    /// Add a dynamic data source
+    pub fn add_data_source(&mut self, data_source: &DataSource) {
+        self.data_sources.push(data_source.into());
+    }
+
+    fn entity_op(&mut self, key: EntityKey, op: EntityOp) {
+        use std::collections::hash_map::Entry;
+
+        let updates = match self.in_handler {
+            true => &mut self.handler_updates,
+            false => &mut self.updates,
+        };
+
+        match updates.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(op);
             }
+            Entry::Occupied(mut entry) => entry.get_mut().accumulate(op),
         }
-        Ok(())
+    }
+
+    pub(crate) fn extend(&mut self, other: EntityCache) {
+        assert!(!other.in_handler);
+
+        self.current.extend(other.current);
+        for (key, op) in other.updates {
+            self.entity_op(key, op);
+        }
     }
 
     /// Return the changes that have been made via `set` and `remove` as
@@ -1621,8 +1641,10 @@ impl EntityCache {
     /// Also returns the updated `LfuCache`.
     pub fn as_modifications(
         mut self,
-        store: &(impl Store + ?Sized),
+        store: &(impl SubgraphStore + ?Sized),
     ) -> Result<ModificationsAndCache, QueryExecutionError> {
+        assert!(!self.in_handler);
+
         // The first step is to make sure all entities being set are in `self.current`.
         // For each subgraph, we need a map of entity type to missing entity ids.
         let missing = self
@@ -1630,7 +1652,8 @@ impl EntityCache {
             .keys()
             .filter(|key| !self.current.contains_key(key));
 
-        let mut missing_by_subgraph: BTreeMap<_, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+        let mut missing_by_subgraph: BTreeMap<_, BTreeMap<&EntityType, Vec<&str>>> =
+            BTreeMap::new();
         for key in missing {
             missing_by_subgraph
                 .entry(&key.subgraph_id)
@@ -1659,7 +1682,7 @@ impl EntityCache {
             let current = self.current.remove(&key).and_then(|entity| entity);
             let modification = match (current, update) {
                 // Entity was created
-                (None, Some(updates)) => {
+                (None, EntityOp::Update(updates)) | (None, EntityOp::Overwrite(updates)) => {
                     // Merging with an empty entity removes null fields.
                     let mut data = Entity::new();
                     data.merge_remove_null_fields(updates);
@@ -1667,7 +1690,7 @@ impl EntityCache {
                     Some(Insert { key, data })
                 }
                 // Entity may have been changed
-                (Some(current), Some(updates)) => {
+                (Some(current), EntityOp::Update(updates)) => {
                     let mut data = current.clone();
                     data.merge_remove_null_fields(updates);
                     self.current.insert(key.clone(), Some(data.clone()));
@@ -1677,13 +1700,22 @@ impl EntityCache {
                         None
                     }
                 }
+                // Entity was removed and then updated, so it will be overwritten
+                (Some(current), EntityOp::Overwrite(data)) => {
+                    self.current.insert(key.clone(), Some(data.clone()));
+                    if current != data {
+                        Some(Overwrite { key, data })
+                    } else {
+                        None
+                    }
+                }
                 // Existing entity was deleted
-                (Some(_), None) => {
+                (Some(_), EntityOp::Remove) => {
                     self.current.insert(key.clone(), None);
                     Some(Remove { key })
                 }
                 // Entity was deleted, but it doesn't exist in the store
-                (None, None) => None,
+                (None, EntityOp::Remove) => None,
             };
             if let Some(modification) = modification {
                 mods.push(modification)
@@ -1691,6 +1723,7 @@ impl EntityCache {
         }
         Ok(ModificationsAndCache {
             modifications: mods,
+            data_sources: self.data_sources,
             entity_lfu_cache: self.current,
         })
     }
@@ -1700,7 +1733,7 @@ impl LfuCache<EntityKey, Option<Entity>> {
     // Helper for cached lookup of an entity.
     fn get_entity(
         &mut self,
-        store: &(impl Store + ?Sized),
+        store: &(impl SubgraphStore + ?Sized),
         key: &EntityKey,
     ) -> Result<Option<Entity>, QueryExecutionError> {
         match self.get(&key) {

@@ -1,15 +1,17 @@
-use graphql_parser::{query as q, schema as s};
 use std::collections::{BTreeMap, HashMap};
 use std::result;
 use std::sync::Arc;
 
-use graph::components::store::*;
-use graph::data::graphql::ObjectOrInterface;
+use graph::data::{
+    graphql::{object, ObjectOrInterface},
+    schema::META_FIELD_TYPE,
+};
 use graph::prelude::*;
+use graph::{components::store::*, data::schema::BLOCK_FIELD_TYPE};
 
-use crate::prelude::*;
 use crate::query::ext::BlockConstraint;
 use crate::schema::ast as sast;
+use crate::{prelude::*, schema::api::ErrorPolicy};
 
 use crate::store::query::{collect_entities_from_query_field, parse_subgraph_id};
 
@@ -18,8 +20,11 @@ use crate::store::query::{collect_entities_from_query_field, parse_subgraph_id};
 pub struct StoreResolver {
     logger: Logger,
     pub(crate) store: Arc<dyn QueryStore>,
+    subscription_manager: Arc<dyn SubscriptionManager>,
     pub(crate) block_ptr: Option<EthereumBlockPointer>,
     deployment: SubgraphDeploymentId,
+    has_non_fatal_errors: bool,
+    error_policy: ErrorPolicy,
 }
 
 impl CheapClone for StoreResolver {}
@@ -32,13 +37,19 @@ impl StoreResolver {
     pub fn for_subscription(
         logger: &Logger,
         deployment: SubgraphDeploymentId,
-        store: Arc<impl Store>,
+        store: Arc<dyn QueryStore>,
+        subscription_manager: Arc<dyn SubscriptionManager>,
     ) -> Self {
         StoreResolver {
             logger: logger.new(o!("component" => "StoreResolver")),
-            store: store.query_store(true),
+            store,
+            subscription_manager,
             block_ptr: None,
             deployment,
+
+            // Checking for non-fatal errors does not work with subscriptions.
+            has_non_fatal_errors: false,
+            error_policy: ErrorPolicy::Deny,
         }
     }
 
@@ -49,76 +60,80 @@ impl StoreResolver {
     /// created
     pub async fn at_block(
         logger: &Logger,
-        store: Arc<impl Store + SubgraphDeploymentStore>,
+        store: Arc<dyn QueryStore>,
+        subscription_manager: Arc<dyn SubscriptionManager>,
         bc: BlockConstraint,
+        error_policy: ErrorPolicy,
         deployment: SubgraphDeploymentId,
     ) -> Result<Self, QueryExecutionError> {
         let store_clone = store.cheap_clone();
         let deployment2 = deployment.clone();
         let block_ptr = graph::spawn_blocking_allow_panic(move || {
-            Self::locate_block(store_clone.as_ref(), bc, deployment2)
+            Self::locate_block(store_clone.as_ref(), bc, deployment2.clone())
         })
         .await
         .map_err(|e| QueryExecutionError::Panic(e.to_string()))
         .and_then(|x| x)?; // Propagate panics.
+
+        let has_non_fatal_errors = store
+            .has_non_fatal_errors(deployment.clone(), Some(block_ptr.block_number()))
+            .await?;
+
         let resolver = StoreResolver {
             logger: logger.new(o!("component" => "StoreResolver")),
-            store: store.query_store(false),
+            store,
+            subscription_manager,
             block_ptr: Some(block_ptr),
             deployment,
+            has_non_fatal_errors,
+            error_policy,
         };
         Ok(resolver)
     }
 
     pub fn block_number(&self) -> BlockNumber {
         self.block_ptr
+            .as_ref()
             .map(|ptr| ptr.number as BlockNumber)
             .unwrap_or(BLOCK_NUMBER_MAX)
     }
 
     fn locate_block(
-        store: &(impl Store + SubgraphDeploymentStore),
+        store: &dyn QueryStore,
         bc: BlockConstraint,
         subgraph: SubgraphDeploymentId,
     ) -> Result<EthereumBlockPointer, QueryExecutionError> {
-        if store
-            .uses_relational_schema(&subgraph)
-            .map_err(StoreError::from)?
-            && !subgraph.is_meta()
-        {
-            // Relational storage (most subgraphs); block constraints fully
-            // supported
-            match bc {
-                BlockConstraint::Number(number) => store
-                    .block_ptr(subgraph.clone())
-                    .map_err(|e| StoreError::from(e).into())
-                    .and_then(|ptr| {
-                        let ptr =
-                            ptr.expect("we should have already checked that the subgraph exists");
-                        if ptr.number < number as u64 {
-                            Err(QueryExecutionError::ValueParseError(
-                                "block.number".to_owned(),
-                                format!(
-                                    "subgraph {} has only indexed up to block number {} \
+        match bc {
+            BlockConstraint::Number(number) => store
+                .block_ptr(subgraph.clone())
+                .map_err(|e| StoreError::from(e).into())
+                .and_then(|ptr| {
+                    let ptr = ptr.expect("we should have already checked that the subgraph exists");
+                    if ptr.number < number {
+                        Err(QueryExecutionError::ValueParseError(
+                            "block.number".to_owned(),
+                            format!(
+                                "subgraph {} has only indexed up to block number {} \
                                  and data for block number {} is therefore not yet available",
-                                    subgraph, ptr.number, number
-                                ),
-                            ))
-                        } else {
-                            // We don't have a way here to look the block hash up from
-                            // the database, and even if we did, there is no guarantee
-                            // that we have the block in our cache. We therefore
-                            // always return an all zeroes hash when users specify
-                            // a block number
-                            // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
-                            Ok(EthereumBlockPointer::from((
-                                web3::types::H256::zero(),
-                                number as u64,
-                            )))
-                        }
-                    }),
-                BlockConstraint::Hash(hash) => store
-                    .block_number(&subgraph, hash)
+                                subgraph, ptr.number, number
+                            ),
+                        ))
+                    } else {
+                        // We don't have a way here to look the block hash up from
+                        // the database, and even if we did, there is no guarantee
+                        // that we have the block in our cache. We therefore
+                        // always return an all zeroes hash when users specify
+                        // a block number
+                        // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
+                        Ok(EthereumBlockPointer::from((
+                            web3::types::H256::zero(),
+                            number as u64,
+                        )))
+                    }
+                }),
+            BlockConstraint::Hash(hash) => {
+                store
+                    .block_number(hash)
                     .map_err(|e| e.into())
                     .and_then(|number| {
                         number
@@ -129,31 +144,15 @@ impl StoreResolver {
                                 )
                             })
                             .map(|number| EthereumBlockPointer::from((hash, number as u64)))
-                    }),
-                BlockConstraint::Latest => store
-                    .block_ptr(subgraph.clone())
-                    .map_err(|e| StoreError::from(e).into())
-                    .and_then(|ptr| {
-                        let ptr =
-                            ptr.expect("we should have already checked that the subgraph exists");
-                        Ok(ptr)
-                    }),
+                    })
             }
-        } else {
-            // JSONB storage or subgraph metadata; only allow BlockConstraint::Latest
-            if matches!(bc, BlockConstraint::Latest) {
-                Ok(EthereumBlockPointer::from((
-                    web3::types::H256::zero(),
-                    BLOCK_NUMBER_MAX as u64,
-                )))
-            } else {
-                Err(QueryExecutionError::NotSupported(
-                    "This subgraph uses JSONB storage, which does not \
-            support querying at a specific block height. Redeploy \
-            a new version of this subgraph to enable this feature."
-                        .to_owned(),
-                ))
-            }
+            BlockConstraint::Latest => store
+                .block_ptr(subgraph.clone())
+                .map_err(|e| StoreError::from(e).into())
+                .and_then(|ptr| {
+                    let ptr = ptr.expect("we should have already checked that the subgraph exists");
+                    Ok(ptr)
+                }),
         }
     }
 
@@ -169,30 +168,42 @@ impl StoreResolver {
         if object_type.is_meta() {
             let hash = self
                 .block_ptr
+                .as_ref()
                 .and_then(|ptr| {
                     // locate_block indicates that we do not have a block hash
                     // by setting the hash to `zero`
                     // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
-                    if ptr.hash == web3::types::H256::zero() {
+                    let hash_h256 = ptr.hash_as_h256();
+                    if hash_h256 == web3::types::H256::zero() {
                         None
                     } else {
-                        Some(q::Value::String(format!("0x{:x}", ptr.hash)))
+                        Some(q::Value::String(format!("0x{:x}", hash_h256)))
                     }
                 })
                 .unwrap_or(q::Value::Null);
             let number = self
                 .block_ptr
+                .as_ref()
                 .map(|ptr| q::Value::Int((ptr.number as i32).into()))
                 .unwrap_or(q::Value::Null);
             let mut map = BTreeMap::new();
             let block = object! {
                 hash: hash,
                 number: number,
+                __typename: BLOCK_FIELD_TYPE
             };
             map.insert("prefetch:block".to_string(), q::Value::List(vec![block]));
             map.insert(
                 "deployment".to_string(),
                 q::Value::String(self.deployment.to_string()),
+            );
+            map.insert(
+                "hasIndexingErrors".to_string(),
+                q::Value::Boolean(self.has_non_fatal_errors),
+            );
+            map.insert(
+                "__typename".to_string(),
+                q::Value::String(META_FIELD_TYPE.to_string()),
             );
             return Ok((None, Some(q::Value::Object(map))));
         }
@@ -217,7 +228,7 @@ impl Resolver for StoreResolver {
         field: &q::Field,
         _field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         if let Some(child) = prefetched_objects {
             Ok(child)
@@ -237,7 +248,7 @@ impl Resolver for StoreResolver {
         field: &q::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         let (prefetched_object, meta) = self.handle_meta(prefetched_object, &object_type)?;
         if let Some(meta) = meta {
@@ -279,11 +290,38 @@ impl Resolver for StoreResolver {
 
         // Subscribe to the store and return the entity change stream
         let deployment_id = parse_subgraph_id(object_type)?;
-        Ok(self.store.subscribe(entities).throttle_while_syncing(
-            &self.logger,
-            self.store.clone(),
-            deployment_id,
-            *SUBSCRIPTION_THROTTLE_INTERVAL,
-        ))
+        Ok(self
+            .subscription_manager
+            .subscribe(entities)
+            .throttle_while_syncing(
+                &self.logger,
+                self.store.clone(),
+                deployment_id,
+                *SUBSCRIPTION_THROTTLE_INTERVAL,
+            ))
+    }
+
+    fn post_process(&self, result: &mut QueryResult) -> Result<(), anyhow::Error> {
+        // Post-processing is only necessary for queries with indexing errors, and no query errors.
+        if !self.has_non_fatal_errors || result.has_errors() {
+            return Ok(());
+        }
+
+        // Add the "indexing_error" to the response.
+        assert!(result.errors_mut().is_empty());
+        *result.errors_mut() = vec![QueryError::IndexingError];
+
+        match self.error_policy {
+            // If indexing errors are denied, we omit results, except for the `_meta` response.
+            // Note that the meta field could have been queried under a different response key,
+            // or a different field queried under the response key `_meta`.
+            ErrorPolicy::Deny => {
+                let data = result.take_data();
+                let meta = data.and_then(|mut d| d.remove_entry("_meta"));
+                result.set_data(meta.map(|m| BTreeMap::from_iter(Some(m))));
+            }
+            ErrorPolicy::Allow => (),
+        }
+        Ok(())
     }
 }

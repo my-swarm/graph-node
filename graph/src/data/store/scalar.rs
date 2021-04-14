@@ -1,10 +1,10 @@
 use diesel::deserialize::FromSql;
 use diesel::serialize::ToSql;
 use diesel_derives::{AsExpression, FromSqlRow};
-use failure::Fail;
 use hex;
 use num_bigint;
 use serde::{self, Deserialize, Serialize};
+use thiserror::Error;
 use web3::types::*;
 
 use stable_hash::{
@@ -14,10 +14,12 @@ use stable_hash::{
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display, Formatter};
 use std::io::Write;
-use std::ops::{Add, Deref, Div, Mul, Rem, Sub};
+use std::ops::{Add, BitAnd, BitOr, Deref, Div, Mul, Rem, Shl, Shr, Sub};
 use std::str::FromStr;
 
 pub use num_bigint::Sign as BigIntSign;
+
+use crate::components::ethereum::BlockHash;
 
 /// All operations on `BigDecimal` return a normalized value.
 // Caveat: The exponent is currently an i64 and may overflow. See
@@ -209,11 +211,11 @@ impl StableHash for BigInt {
     }
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum BigIntOutOfRangeError {
-    #[fail(display = "Cannot convert negative BigInt into type")]
+    #[error("Cannot convert negative BigInt into type")]
     Negative,
-    #[fail(display = "BigInt value is too large for type")]
+    #[error("BigInt value is too large for type")]
     Overflow,
 }
 
@@ -446,6 +448,38 @@ impl Rem for BigInt {
     }
 }
 
+impl BitOr for BigInt {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self::from(self.0.bitor(other.0))
+    }
+}
+
+impl BitAnd for BigInt {
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self {
+        Self::from(self.0.bitand(other.0))
+    }
+}
+
+impl Shl<u8> for BigInt {
+    type Output = Self;
+
+    fn shl(self, bits: u8) -> Self {
+        Self::from(self.0.shl(bits.into()))
+    }
+}
+
+impl Shr<u8> for BigInt {
+    type Output = Self;
+
+    fn shr(self, bits: u8) -> Self {
+        Self::from(self.0.shr(bits.into()))
+    }
+}
+
 /// A byte array that's serialized as a hex string prefixed by `0x`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bytes(Box<[u8]>);
@@ -492,6 +526,18 @@ impl<'a> From<&'a [u8]> for Bytes {
 impl From<Address> for Bytes {
     fn from(address: Address) -> Bytes {
         Bytes::from(address.as_ref())
+    }
+}
+
+impl From<web3::types::Bytes> for Bytes {
+    fn from(bytes: web3::types::Bytes) -> Bytes {
+        Bytes::from(bytes.0.as_slice())
+    }
+}
+
+impl From<BlockHash> for Bytes {
+    fn from(hash: BlockHash) -> Self {
+        Bytes(hash.0)
     }
 }
 

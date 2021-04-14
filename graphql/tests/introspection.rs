@@ -1,18 +1,17 @@
 #[macro_use]
 extern crate pretty_assertions;
 
-use graphql_parser::{query as q, schema as s};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use graph::data::graphql::ObjectOrInterface;
+use graph::data::graphql::{object, object_value, ObjectOrInterface};
 use graph::prelude::{
-    o, slog, tokio, ApiSchema, Logger, Query, QueryExecutionError, QueryResult, Schema,
+    o, q, s, slog, tokio, ApiSchema, Logger, Query, QueryExecutionError, QueryResult, Schema,
     SubgraphDeploymentId,
 };
 use graph_graphql::prelude::{
-    api_schema, execute_query, object, object_value, ExecutionContext, Query as PreparedQuery,
-    QueryExecutionOptions, Resolver,
+    api_schema, execute_query, ExecutionContext, Query as PreparedQuery, QueryExecutionOptions,
+    Resolver,
 };
 use test_store::LOAD_MANAGER;
 
@@ -37,7 +36,7 @@ impl Resolver for MockResolver {
         _field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         Ok(q::Value::Null)
     }
@@ -48,7 +47,7 @@ impl Resolver for MockResolver {
         _field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         Ok(q::Value::Null)
     }
@@ -552,9 +551,7 @@ fn expected_mock_schema_introspection() -> q::Value {
 async fn introspection_query(schema: Schema, query: &str) -> QueryResult {
     // Create the query
     let query = Query::new(
-        Arc::new(ApiSchema::from_api_schema(schema).unwrap()),
-        graphql_parser::parse_query(query).unwrap(),
-        None,
+        graphql_parser::parse_query(query).unwrap().into_static(),
         None,
     );
 
@@ -568,7 +565,8 @@ async fn introspection_query(schema: Schema, query: &str) -> QueryResult {
         load_manager: LOAD_MANAGER.clone(),
     };
 
-    let result = match PreparedQuery::new(&logger, query, None, 100) {
+    let schema = Arc::new(ApiSchema::from_api_schema(schema).unwrap());
+    let result = match PreparedQuery::new(&logger, schema, None, query, None, 100) {
         Ok(query) => {
             Ok(Arc::try_unwrap(execute_query(query, None, None, options, false).await).unwrap())
         }
@@ -1132,7 +1130,7 @@ async fn successfully_runs_introspection_query_against_complex_schema() {
         SubgraphDeploymentId::new("complexschema").unwrap(),
     )
     .unwrap();
-    schema.document = api_schema(&schema.document).unwrap();
+    schema.document = api_schema(&schema.document, &BTreeSet::new()).unwrap();
 
     let result = introspection_query(
         schema.clone(),
@@ -1232,7 +1230,7 @@ async fn successfully_runs_introspection_query_against_complex_schema() {
     )
     .await;
 
-    assert!(!result.has_errors(), format!("{:#?}", result));
+    assert!(!result.has_errors(), "{:#?}", result);
 }
 
 #[tokio::test]
@@ -1242,7 +1240,7 @@ async fn introspection_possible_types() {
         SubgraphDeploymentId::new("complexschema").unwrap(),
     )
     .unwrap();
-    schema.document = api_schema(&schema.document).unwrap();
+    schema.document = api_schema(&schema.document, &BTreeSet::new()).unwrap();
 
     // Test "possibleTypes" introspection in interfaces
     let response = introspection_query(

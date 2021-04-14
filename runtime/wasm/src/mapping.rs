@@ -1,5 +1,4 @@
-use crate::module::WasmInstance;
-use ethabi::LogParam;
+use crate::module::{ExperimentalFeatures, WasmInstance};
 use futures::sync::mpsc;
 use futures03::channel::oneshot::Sender;
 use graph::components::ethereum::*;
@@ -8,9 +7,11 @@ use graph::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
-use strum_macros::AsStaticStr;
-use web3::types::{Log, Transaction};
+
+lazy_static! {
+    /// Verbose logging of mapping inputs
+    pub static ref LOG_TRIGGER_DATA: bool = std::env::var("GRAPH_LOG_TRIGGER_DATA").is_ok();
+}
 
 /// Spawn a wasm module in its own thread.
 pub fn spawn_module(
@@ -20,7 +21,7 @@ pub fn spawn_module(
     host_metrics: Arc<HostMetrics>,
     runtime: tokio::runtime::Handle,
     timeout: Option<Duration>,
-    allow_non_deterministic_ipfs: bool,
+    experimental_features: ExperimentalFeatures,
 ) -> Result<mpsc::Sender<MappingRequest>, anyhow::Error> {
     let valid_module = Arc::new(ValidModule::new(&raw_module)?);
 
@@ -36,72 +37,76 @@ pub fn spawn_module(
     let conf =
         thread::Builder::new().name(format!("mapping-{}-{}", &subgraph_id, uuid::Uuid::new_v4()));
     conf.spawn(move || {
-        runtime.enter(|| {
-            // Pass incoming triggers to the WASM module and return entity changes;
-            // Stop when canceled because all RuntimeHosts and their senders were dropped.
-            match mapping_request_receiver
-                .map_err(|()| unreachable!())
-                .for_each(move |request| {
-                    let MappingRequest {
-                        ctx,
-                        trigger,
-                        result_sender,
-                    } = request;
+        let _runtime_guard = runtime.enter();
 
-                    // Start the WASM module runtime.
-                    let section = host_metrics.stopwatch.start_section("module_init");
-                    let module = WasmInstance::from_valid_module_with_ctx(
-                        valid_module.clone(),
-                        ctx,
-                        host_metrics.clone(),
-                        timeout,
-                        allow_non_deterministic_ipfs,
-                    )?;
-                    section.end();
+        // Pass incoming triggers to the WASM module and return entity changes;
+        // Stop when canceled because all RuntimeHosts and their senders were dropped.
+        match mapping_request_receiver
+            .map_err(|()| unreachable!())
+            .for_each(move |request| {
+                let MappingRequest {
+                    ctx,
+                    trigger,
+                    result_sender,
+                } = request;
+                let logger = ctx.logger.cheap_clone();
 
-                    let section = host_metrics.stopwatch.start_section("run_handler");
-                    let result = match trigger {
-                        MappingTrigger::Log {
-                            transaction,
-                            log,
-                            params,
-                            handler,
-                        } => module.handle_ethereum_log(
-                            handler.handler.as_str(),
-                            transaction,
-                            log,
-                            params,
-                        ),
-                        MappingTrigger::Call {
-                            transaction,
-                            call,
-                            inputs,
-                            outputs,
-                            handler,
-                        } => module.handle_ethereum_call(
-                            handler.handler.as_str(),
-                            transaction,
-                            call,
-                            inputs,
-                            outputs,
-                        ),
-                        MappingTrigger::Block { handler } => {
-                            module.handle_ethereum_block(handler.handler.as_str())
-                        }
-                    };
-                    section.end();
+                // Start the WASM module runtime.
+                let section = host_metrics.stopwatch.start_section("module_init");
+                let module = WasmInstance::from_valid_module_with_ctx(
+                    valid_module.cheap_clone(),
+                    ctx,
+                    host_metrics.cheap_clone(),
+                    timeout,
+                    experimental_features.clone(),
+                )?;
+                section.end();
 
-                    result_sender
-                        .send((result, future::ok(Instant::now())))
-                        .map_err(|_| anyhow::anyhow!("WASM module result receiver dropped."))
-                })
-                .wait()
-            {
-                Ok(()) => debug!(logger, "Subgraph stopped, WASM runtime thread terminated"),
-                Err(e) => debug!(logger, "WASM runtime thread terminated abnormally";
+                let section = host_metrics.stopwatch.start_section("run_handler");
+                if *LOG_TRIGGER_DATA {
+                    debug!(logger, "trigger data: {:?}", trigger);
+                }
+                let result = match trigger {
+                    MappingTrigger::Log {
+                        transaction,
+                        log,
+                        params,
+                        handler,
+                    } => module.handle_ethereum_log(
+                        handler.handler.as_str(),
+                        transaction,
+                        log,
+                        params,
+                    ),
+                    MappingTrigger::Call {
+                        transaction,
+                        call,
+                        inputs,
+                        outputs,
+                        handler,
+                    } => module.handle_ethereum_call(
+                        handler.handler.as_str(),
+                        transaction,
+                        call,
+                        inputs,
+                        outputs,
+                    ),
+                    MappingTrigger::Block { handler } => {
+                        module.handle_ethereum_block(handler.handler.as_str())
+                    }
+                };
+                section.end();
+
+                result_sender
+                    .send(result)
+                    .map_err(|_| anyhow::anyhow!("WASM module result receiver dropped."))
+            })
+            .wait()
+        {
+            Ok(()) => debug!(logger, "Subgraph stopped, WASM runtime thread terminated"),
+            Err(e) => debug!(logger, "WASM runtime thread terminated abnormally";
                                     "error" => e.to_string()),
-            }
-        })
+        }
     })
     .map(|_| ())
     .context("Spawning WASM runtime thread failed")?;
@@ -109,36 +114,11 @@ pub fn spawn_module(
     Ok(mapping_request_sender)
 }
 
-#[derive(Debug, AsStaticStr)]
-pub(crate) enum MappingTrigger {
-    Log {
-        transaction: Arc<Transaction>,
-        log: Arc<Log>,
-        params: Vec<LogParam>,
-        handler: MappingEventHandler,
-    },
-    Call {
-        transaction: Arc<Transaction>,
-        call: Arc<EthereumCall>,
-        inputs: Vec<LogParam>,
-        outputs: Vec<LogParam>,
-        handler: MappingCallHandler,
-    },
-    Block {
-        handler: MappingBlockHandler,
-    },
-}
-
-type MappingResponse = (
-    Result<BlockState, MappingError>,
-    futures::Finished<Instant, Error>,
-);
-
 #[derive(Debug)]
 pub struct MappingRequest {
     pub(crate) ctx: MappingContext,
     pub(crate) trigger: MappingTrigger,
-    pub(crate) result_sender: Sender<MappingResponse>,
+    pub(crate) result_sender: Sender<Result<BlockState, MappingError>>,
 }
 
 #[derive(Debug)]
@@ -188,13 +168,15 @@ impl ValidModule {
         config.interruptable(true); // For timeouts.
         config.cranelift_nan_canonicalization(true); // For NaN determinism.
         config.cranelift_opt_level(wasmtime::OptLevel::None);
-        let engine = &wasmtime::Engine::new(&config);
+        let engine = &wasmtime::Engine::new(&config)?;
         let module = wasmtime::Module::from_binary(&engine, raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        // Unwrap: Module linking is disabled.
         for (name, module) in module
             .imports()
-            .map(|import| (import.name(), import.module()))
+            .map(|import| (import.name().unwrap(), import.module()))
         {
             import_name_to_modules
                 .entry(name.to_string())

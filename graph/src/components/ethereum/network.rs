@@ -1,12 +1,16 @@
-use failure::{format_err, Error};
+use anyhow::anyhow;
 use rand::seq::IteratorRandom;
-use std::cmp::{Ord, Ordering, PartialOrd};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::{
+    cmp::{Ord, Ordering, PartialOrd},
+    collections::BTreeSet,
+};
 
 use crate::components::ethereum::EthereumAdapter;
 pub use crate::impl_slog_value;
+use crate::prelude::Error;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,40 +45,30 @@ impl PartialOrd for NodeCapabilities {
 }
 
 impl FromStr for NodeCapabilities {
-    type Err = anyhow::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let capabilities: Vec<&str> = s.split(",").collect();
+        let capabilities: BTreeSet<&str> = s.split(",").collect();
         Ok(NodeCapabilities {
-            archive: capabilities
-                .iter()
-                .find(|cap| cap.eq(&&"archive"))
-                .is_some(),
-            traces: capabilities.iter().find(|cap| cap.eq(&&"traces")).is_some(),
+            archive: capabilities.contains("archive"),
+            traces: capabilities.contains("traces"),
         })
     }
 }
 
 impl fmt::Display for NodeCapabilities {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            NodeCapabilities {
-                archive: true,
-                traces: true,
-            } => write!(f, "archive, trace"),
-            NodeCapabilities {
-                archive: false,
-                traces: true,
-            } => write!(f, "full, trace"),
-            NodeCapabilities {
-                archive: false,
-                traces: false,
-            } => write!(f, "full"),
-            NodeCapabilities {
-                archive: true,
-                traces: false,
-            } => write!(f, "archive"),
+        let NodeCapabilities { archive, traces } = self;
+
+        let mut capabilities = vec![];
+        if *archive {
+            capabilities.push("archive");
         }
+        if *traces {
+            capabilities.push("traces");
+        }
+
+        f.write_str(&capabilities.join(", "))
     }
 }
 
@@ -102,7 +96,7 @@ impl EthereumNetworkAdapters {
             .filter(|adapter| &adapter.capabilities >= required_capabilities)
             .collect();
         if sufficient_adapters.is_empty() {
-            return Err(format_err!(
+            return Err(anyhow!(
                 "A matching Ethereum network with {:?} was not found.",
                 required_capabilities
             ));
@@ -188,7 +182,7 @@ impl EthereumNetworks {
     ) -> Result<&Arc<dyn EthereumAdapter>, Error> {
         self.networks
             .get(&network_name)
-            .ok_or(format_err!("network not supported: {}", &network_name))
+            .ok_or(anyhow!("network not supported: {}", &network_name))
             .and_then(|adapters| adapters.cheapest_with(requirements))
     }
 }

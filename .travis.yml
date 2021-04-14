@@ -1,9 +1,12 @@
 dist: bionic
 language: rust
+# This line would cache cargo-audit once installed,
+# but instead will fail from the 10 minute timeout after
+# printing the line "creating directory /home/travis/.cache/sccache"
+#cache: cargo
 rust:
   - stable
   - beta
-  - nightly
 
 # Select pre-installed services
 addons:
@@ -27,8 +30,6 @@ before_install:
 
 matrix:
   fast_finish: true
-  allow_failures:
-    - rust: nightly
   include:
     # Some env var is always necessary to differentiate included builds
     # Check coding style

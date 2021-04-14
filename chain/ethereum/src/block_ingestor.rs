@@ -1,11 +1,20 @@
 use lazy_static;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use graph::prelude::*;
-use web3::types::*;
+use graph::{
+    prelude::{
+        error, info, o, stream, tokio, trace, warn, web3::types::H256, BlockNumber, ChainStore,
+        ComponentLoggerConfig, ElasticComponentLoggerConfig, Error, EthereumAdapter,
+        EthereumAdapterError, EthereumBlock, Future, Future01CompatExt, LogCode, Logger,
+        LoggerFactory, MetricsRegistry, Stream,
+    },
+    prometheus::GaugeVec,
+};
 
 lazy_static! {
-    static ref CLEANUP_BLOCKS: bool = std::env::var("GRAPH_ETHEREUM_CLEANUP_BLOCKS")
+    // graph_node::config disallows setting this in a store with multiple
+    // shards. See 8b6ad0c64e244023ac20ced7897fe666 for the reason
+    pub static ref CLEANUP_BLOCKS: bool = std::env::var("GRAPH_ETHEREUM_CLEANUP_BLOCKS")
         .ok()
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -41,7 +50,7 @@ where
 {
     chain_store: Arc<S>,
     eth_adapter: Arc<dyn EthereumAdapter>,
-    ancestor_count: u64,
+    ancestor_count: BlockNumber,
     _network_name: String,
     logger: Logger,
     polling_interval: Duration,
@@ -54,7 +63,7 @@ where
     pub fn new(
         chain_store: Arc<S>,
         eth_adapter: Arc<dyn EthereumAdapter>,
-        ancestor_count: u64,
+        ancestor_count: BlockNumber,
         network_name: String,
         logger_factory: &LoggerFactory,
         polling_interval: Duration,
@@ -68,7 +77,7 @@ where
             }),
         );
 
-        let logger = logger.new(o!("network_name" => network_name.clone()));
+        let logger = logger.new(o!("provider" => eth_adapter.provider().to_string()));
 
         Ok(BlockIngestor {
             chain_store,
@@ -104,7 +113,7 @@ where
                 self.cleanup_cached_blocks()
             }
 
-            tokio::time::delay_for(self.polling_interval).await;
+            tokio::time::sleep(self.polling_interval).await;
         }
     }
 

@@ -16,6 +16,8 @@ pub mod log;
 /// `CheapClone` trait.
 pub mod cheap_clone;
 
+pub mod ipfs_client;
+
 /// Module with mocks for different parts of the system.
 pub mod mock {
     pub use crate::components::ethereum::MockEthereumAdapter;
@@ -29,6 +31,10 @@ pub use task_spawn::{
 };
 
 pub use bytes;
+pub use prometheus;
+pub use semver;
+pub use stable_hash;
+pub use tokio_stream;
 pub use url;
 
 /// A prelude that makes all system component traits and data types available.
@@ -40,11 +46,11 @@ pub use url;
 /// ```
 pub mod prelude {
     pub use super::entity;
-    pub use anyhow::{self, Context as _};
+    pub use ::anyhow;
+    pub use anyhow::{anyhow, Context as _, Error};
     pub use async_trait::async_trait;
     pub use bigdecimal;
     pub use ethabi;
-    pub use failure::{self, err_msg, format_err, Error, Fail, SyncFailure};
     pub use futures::future;
     pub use futures::prelude::*;
     pub use futures::stream;
@@ -65,6 +71,7 @@ pub mod prelude {
     pub use std::pin::Pin;
     pub use std::sync::Arc;
     pub use std::time::Duration;
+    pub use thiserror;
     pub use tiny_keccak;
     pub use tokio;
     pub use web3;
@@ -80,7 +87,7 @@ pub mod prelude {
         EthereumBlockWithTriggers, EthereumCall, EthereumCallData, EthereumCallFilter,
         EthereumContractCall, EthereumContractCallError, EthereumEventData, EthereumLogFilter,
         EthereumNetworkIdentifier, EthereumTransactionData, EthereumTrigger, LightEthereumBlock,
-        LightEthereumBlockExt, ProviderEthRpcMetrics, SubgraphEthRpcMetrics,
+        LightEthereumBlockExt, MappingTrigger, ProviderEthRpcMetrics, SubgraphEthRpcMetrics,
     };
     pub use crate::components::graphql::{
         GraphQlRunner, QueryLoadManager, SubscriptionResultFuture,
@@ -97,17 +104,17 @@ pub mod prelude {
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        AttributeIndexDefinition, BlockNumber, ChainStore, ChildMultiplicity, EntityCache,
-        EntityChange, EntityChangeOperation, EntityCollection, EntityFilter, EntityKey, EntityLink,
+        BlockNumber, ChainStore, ChildMultiplicity, EntityCache, EntityChange,
+        EntityChangeOperation, EntityCollection, EntityFilter, EntityKey, EntityLink,
         EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange, EntityWindow,
-        EthereumCallCache, MetadataOperation, ParentLink, PoolWaitStats, QueryStore, Store,
-        StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphDeploymentStore,
-        TransactionAbortError, WindowAttribute, BLOCK_NUMBER_MAX, SUBSCRIPTION_THROTTLE_INTERVAL,
+        EthereumCallCache, ParentLink, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
+        StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphStore, WindowAttribute,
+        BLOCK_NUMBER_MAX, SUBSCRIPTION_THROTTLE_INTERVAL,
     };
     pub use crate::components::subgraph::{
-        BlockState, DataSourceLoader, DataSourceTemplateInfo, HostMetrics, RuntimeHost,
-        RuntimeHostBuilder, SubgraphAssignmentProvider, SubgraphInstance, SubgraphInstanceManager,
-        SubgraphRegistrar, SubgraphVersionSwitchingMode,
+        BlockState, DataSourceTemplateInfo, HostMetrics, RuntimeHost, RuntimeHostBuilder,
+        SubgraphAssignmentProvider, SubgraphInstanceManager, SubgraphRegistrar,
+        SubgraphVersionSwitchingMode,
     };
     pub use crate::components::{EventConsumer, EventProducer};
 
@@ -122,17 +129,17 @@ pub mod prelude {
     pub use crate::data::store::ethereum::*;
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
     pub use crate::data::store::{
-        AssignmentEvent, Attribute, Entity, NodeId, SubgraphEntityPair, SubgraphVersionSummary,
-        ToEntityId, ToEntityKey, TryIntoEntity, Value, ValueType,
+        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, ToEntityId, ToEntityKey,
+        TryIntoEntity, Value, ValueType,
     };
-    pub use crate::data::subgraph::schema::{SubgraphDeploymentEntity, TypedEntity};
+    pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{
         BlockHandlerFilter, CreateSubgraphResult, DataSource, DataSourceContext,
         DataSourceTemplate, DeploymentState, Link, MappingABI, MappingBlockHandler,
         MappingCallHandler, MappingEventHandler, SubgraphAssignmentProviderError,
-        SubgraphAssignmentProviderEvent, SubgraphDeploymentId, SubgraphManifest,
-        SubgraphManifestResolveError, SubgraphManifestValidationError, SubgraphName,
-        SubgraphRegistrarError, UnvalidatedSubgraphManifest,
+        SubgraphDeploymentId, SubgraphManifest, SubgraphManifestResolveError,
+        SubgraphManifestValidationError, SubgraphName, SubgraphRegistrarError,
+        UnvalidatedSubgraphManifest,
     };
     pub use crate::data::subscription::{
         QueryResultStream, Subscription, SubscriptionError, SubscriptionResult,
@@ -149,7 +156,32 @@ pub mod prelude {
     };
     pub use crate::log::split::split_logger;
     pub use crate::util::cache_weight::CacheWeight;
-    pub use crate::util::error::CompatErr;
     pub use crate::util::futures::{retry, TimeoutError};
     pub use crate::util::stats::MovingStats;
+
+    macro_rules! static_graphql {
+        ($m:ident, $m2:ident, {$($n:ident,)*}) => {
+            pub mod $m {
+                use graphql_parser::$m2 as $m;
+                pub use $m::*;
+                $(
+                    pub type $n = $m::$n<'static, String>;
+                )*
+            }
+        };
+    }
+
+    // Static graphql mods. These are to be phased out, with a preference
+    // toward making graphql generic over text. This helps to ease the
+    // transition by providing the old graphql-parse 0.2.x API
+    static_graphql!(q, query, {
+        Document, Value, OperationDefinition, InlineFragment, TypeCondition,
+        FragmentSpread, Field, Selection, SelectionSet, FragmentDefinition,
+        Directive, VariableDefinition, Type,
+    });
+    static_graphql!(s, schema, {
+        Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,
+        EnumType, Type, Document, ScalarType, InputValue, DirectiveDefinition,
+        UnionType, InputObjectType, EnumValue,
+    });
 }

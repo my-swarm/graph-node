@@ -2,12 +2,14 @@ use git_testament::{git_testament, render_testament};
 use lazy_static::lazy_static;
 use structopt::StructOpt;
 
+use crate::config;
+
 git_testament!(TESTAMENT);
 lazy_static! {
     static ref RENDERED_TESTAMENT: String = render_testament!(TESTAMENT);
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Clone, Debug, StructOpt)]
 #[structopt(
     name = "graph-node",
     about = "Scalable queries for a decentralized future",
@@ -15,6 +17,16 @@ lazy_static! {
     version = RENDERED_TESTAMENT.as_str()
 )]
 pub struct Opt {
+    #[structopt(
+        long,
+        env = "GRAPH_NODE_CONFIG",
+        conflicts_with_all = &["postgres-url", "postgres-secondary-hosts", "postgres-host-weights"],
+        required_unless = "postgres-url",
+        help = "the name of the configuration file",
+    )]
+    pub config: Option<String>,
+    #[structopt(long, help = "validate the configuration and exit")]
+    pub check_config: bool,
     #[structopt(
         long,
         value_name = "[NAME:]IPFS_HASH",
@@ -26,13 +38,17 @@ pub struct Opt {
         long,
         value_name = "URL",
         env = "POSTGRES_URL",
+        conflicts_with = "config",
+        required_unless = "config",
         help = "Location of the Postgres database used for storing entities"
     )]
-    pub postgres_url: String,
+    pub postgres_url: Option<String>,
     #[structopt(
         long,
         value_name = "URL,",
+        use_delimiter = true,
         env = "GRAPH_POSTGRES_SECONDARY_HOSTS",
+        conflicts_with = "config",
         help = "Comma-separated list of host names/IP's for read-only Postgres replicas, \
            which will share the load with the primary server"
     )]
@@ -41,7 +57,9 @@ pub struct Opt {
     #[structopt(
         long,
         value_name = "WEIGHT,",
+        use_delimiter = true,
         env = "GRAPH_POSTGRES_HOST_WEIGHTS",
+        conflicts_with = "config",
         help = "Comma-separated list of relative weights for selecting the main database \
     and secondary databases. The list is in the order MAIN,REPLICA1,REPLICA2,...\
     A host will receive approximately WEIGHT/SUM(WEIGHTS) fraction of total queries. \
@@ -51,27 +69,27 @@ pub struct Opt {
     #[structopt(
         long,
         min_values=0,
-        required_unless_one = &["ethereum-ws", "ethereum-ipc"],
-        conflicts_with_all = &["ethereum-ws", "ethereum-ipc"],
-        value_name="NETWORK_NAME:URL",
+        required_unless_one = &["ethereum-ws", "ethereum-ipc", "config"],
+        conflicts_with_all = &["ethereum-ws", "ethereum-ipc", "config"],
+        value_name="NETWORK_NAME:[CAPABILITIES]:URL",
         env="ETHEREUM_RPC",
-        help= "Ethereum network name (e.g. 'mainnet') and Ethereum RPC URL, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive'), and an Ethereum RPC URL, separated by a ':'",
     )]
     pub ethereum_rpc: Vec<String>,
     #[structopt(long, min_values=0,
-        required_unless_one = &["ethereum-rpc", "ethereum-ipc"],
-        conflicts_with_all = &["ethereum-rpc", "ethereum-ipc"],
-        value_name="NETWORK_NAME:URL",
+        required_unless_one = &["ethereum-rpc", "ethereum-ipc", "config"],
+        conflicts_with_all = &["ethereum-rpc", "ethereum-ipc", "config"],
+        value_name="NETWORK_NAME:[CAPABILITIES]:URL",
         env="ETHEREUM_WS",
-        help= "Ethereum network name (e.g. 'mainnet') and Ethereum WebSocket URL, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive`, and an Ethereum WebSocket URL, separated by a ':'",
     )]
     pub ethereum_ws: Vec<String>,
     #[structopt(long, min_values=0,
-        required_unless_one = &["ethereum-rpc", "ethereum-ws"],
-        conflicts_with_all = &["ethereum-rpc", "ethereum-ws"],
-        value_name="NETWORK_NAME:FILE",
+        required_unless_one = &["ethereum-rpc", "ethereum-ws", "config"],
+        conflicts_with_all = &["ethereum-rpc", "ethereum-ws", "config"],
+        value_name="NETWORK_NAME:[CAPABILITIES]:FILE",
         env="ETHEREUM_IPC",
-        help= "Ethereum network name (e.g. 'mainnet') and Ethereum IPC pipe, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive'), and an Ethereum IPC pipe, separated by a ':'",
     )]
     pub ethereum_ipc: Vec<String>,
     #[structopt(
@@ -195,4 +213,34 @@ pub struct Opt {
         help = "HTTP endpoint for 3box profiles"
     )]
     pub three_box_api: String,
+}
+
+impl From<Opt> for config::Opt {
+    fn from(opt: Opt) -> Self {
+        let Opt {
+            postgres_url,
+            config,
+            store_connection_pool_size,
+            postgres_host_weights,
+            postgres_secondary_hosts,
+            disable_block_ingestor,
+            node_id,
+            ethereum_rpc,
+            ethereum_ws,
+            ethereum_ipc,
+            ..
+        } = opt;
+        config::Opt {
+            postgres_url,
+            config,
+            store_connection_pool_size,
+            postgres_host_weights,
+            postgres_secondary_hosts,
+            disable_block_ingestor,
+            node_id,
+            ethereum_rpc,
+            ethereum_ws,
+            ethereum_ipc,
+        }
+    }
 }

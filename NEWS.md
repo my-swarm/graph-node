@@ -1,6 +1,172 @@
 # NEWS
 
-## Unreleased
+## next - unreleased
+
+- The `GRAPH_ETH_CALL_BY_NUMBER` environment variable has been removed. Graph Node requires an
+  Ethereum client that support EIP-1898, which all major clients support.
+- Added support for IPFS versions larger than 0.4.
+
+## 0.22.0
+
+### Feature: Block store sharding
+This release makes it possible to [shard the block and call cache](./docs/sharding.md) for chain
+data across multiple independent Postgres databases. **This feature is considered experimental. We
+encourage users to try this out in a test environment, but do not recommend it yet for production
+use.** In particular, the details of how sharding is configured may change in backwards-incompatible
+ways in the future.
+
+### Feature: Non-fatal errors update
+Non-fatal errors (see release 0.20 for details) is documented and can now be enabled on graph-cli.
+Various related bug fixes have been made #2121 #2136 #2149 #2160.
+
+### Improvements
+- Add bitwise operations and string constructor to BigInt #2151.
+- docker: Allow custom ethereum poll interval #2139.
+- Deterministic error work in preparation for gas #2112
+
+### Bug fixes
+- Fix not contains filter #2146.
+- Resolve __typename in _meta field #2118
+- Add CORS for all HTTP responses #2196
+
+## 0.21.1
+
+- Fix subgraphs failing with a `fatalError` when deployed while already running
+  (#2104).
+- Fix missing `scalar Int` declaration in index node GraphQL API, causing
+  indexer-service queries to fail (#2104).
+
+## 0.21.0
+
+### Feature: Database sharding
+
+This release makes it possible to [shard subgraph
+storage](./docs/sharding.md) and spread subgraph deployments, and the load
+coming from indexing and querying them across multiple independent Postgres
+databases.
+
+**This feature is considered experimenatal. We encourage users to try this
+out in a test environment, but do not recommend it yet for production use**
+In particular, the details of how sharding is configured may change in
+backwards-incompatible ways in the future.
+
+### Breaking change: Require a block number in `proofOfIndexing` queries
+
+This changes the `proofOfIndexing` GraphQL API from
+
+```graphql
+type Query {
+  proofOfIndexing(subgraph: String!, blockHash: Bytes!, indexer: Bytes): Bytes
+}
+```
+
+to
+
+```graphql
+type Query {
+  proofOfIndexing(
+    subgraph: String!
+    blockNumber: Int!
+    blockHash: Bytes!
+    indexer: Bytes
+  ): Bytes
+}
+```
+
+This allows the indexer agent to provide a block number and hash to be able
+to obtain a POI even if this block is not cached in the Ethereum blocks
+cache. Prior to this, the POI would be `null` if this wasn't the case, even
+if the subgraph deployment in question was up to date, leading to the indexer
+missing out on indexing rewards.
+
+### Misc
+
+- Fix non-determinism caused by not (always) correctly reverting dynamic
+  sources when handling reorgs.
+- Integrate the query cache into subscriptions to improve their performance.
+- Add `graphman` crate for managing Graph Node infrastructure.
+- Improve query cache logging.
+- Expose indexing status port (`8030`) from Docker image.
+- Remove support for unnecessary data sources `templates` inside subgraph
+  data sources. They are only supported at the top level.
+- Avoid sending empty store events through the database.
+- Fix database connection deadlocks.
+- Rework the codebase to use `anyhow` instead of `failure`.
+- Log stack trace in case of database connection timeouts, to help with root-causing.
+- Fix stack overflows in GraphQL parsing.
+- Disable fulltext search by default (it is nondeterministic and therefore
+  not currently supported in the network).
+
+## 0.20.0
+
+**NOTE: JSONB storage is no longer supported. Do not upgrade to this
+release if you still have subgraphs that were deployed with a version
+before 0.16. They need to be redeployed before updating to this version.**
+
+You can check if you have JSONB subgraphs by running the query `select count(*) from deployment_schemas where version='split'` in `psql`. If that
+query returns `0`, you do not have JSONB subgraphs and it is safe to upgrde
+to this version.
+
+### Feature: `_meta` field
+
+Subgraphs sometimes fall behind, be it due to failing or the Graph Node may be having issues. The
+`_meta` field can now be added to any query so that it is possible to determine against which block
+the query was effectively executed. Applications can use this to warn users if the data becomes
+stale. It is as simple as adding this to your query:
+
+```graphql
+_meta {
+  block {
+    number
+    hash
+  }
+}
+```
+
+### Feature: Non-fatal errors
+
+Indexing errors on already synced subgraphs no longer need to cause the entire subgraph to grind to
+a halt. Subgraphs can now be configured to continue syncing in the presence of errors, by simply
+skipping the problematic handler. This gives subgraph authors time to correct their subgraphs while the nodes can continue to serve up-to-date the data. This requires setting a flag on the subgraph manifest:
+
+```yaml
+features:
+  - nonFatalErrors
+```
+
+And the query must also opt-in to querying data with potential inconsistencies:
+
+```graphql
+foos(first: 100, subgraphError: allow) {
+  id
+}
+```
+
+If the subgraph encounters and error the query will return both the data and a graphql error with
+the message `indexing_error`.
+
+Note that some errors are still fatal, to be non-fatal the error must be known to be deterministic. The `_meta` field can be used to check if the subgraph has skipped over errors:
+
+```graphql
+_meta {
+  hasIndexingErrors
+}
+```
+
+The `features` section of the manifest requires depending on the graph-cli master branch until the next version (after `0.19.0`) is released.
+
+### Ethereum
+
+- Support for `tuple[]` (#1973).
+- Support multiple Ethereum endpoints per network with different capabilities (#1810).
+
+### Performance
+
+- Avoid cloning results assembled from partial results (#1907).
+
+### Security
+
+- Add `cargo-audit` to the build process, update dependencies (#1998).
 
 ## 0.19.2
 

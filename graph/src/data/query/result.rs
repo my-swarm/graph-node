@@ -1,28 +1,41 @@
 use super::error::{QueryError, QueryExecutionError};
-use crate::{data::graphql::SerializableValue, prelude::CacheWeight};
-use graphql_parser::query as q;
+use crate::{
+    data::graphql::SerializableValue,
+    prelude::{q, CacheWeight, SubgraphDeploymentId},
+};
+use http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    CONTENT_TYPE,
+};
 use serde::ser::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-fn serialize_data<S>(data: &Option<q::Value>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_data<S>(data: &Option<Data>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    SerializableValue(data.as_ref().unwrap_or(&q::Value::Null)).serialize(serializer)
+    let mut ser = serializer.serialize_map(None)?;
+
+    // Unwrap: data is only serialized if it is `Some`.
+    for (k, v) in data.as_ref().unwrap() {
+        ser.serialize_entry(k, &SerializableValue(v))?;
+    }
+    ser.end()
 }
 
-fn serialize_value_map<S>(data: &Vec<Arc<Data>>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_value_map<'a, S>(
+    data: impl Iterator<Item = &'a Data>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    // We only serialize `data` if it is not empty
-    assert!(!data.is_empty());
     let mut ser = serializer.serialize_map(None)?;
     for map in data {
-        for (k, v) in map.as_ref() {
+        for (k, v) in map {
             ser.serialize_entry(k, &SerializableValue(v))?;
         }
     }
@@ -31,122 +44,213 @@ where
 
 pub type Data = BTreeMap<String, q::Value>;
 
+#[derive(Debug)]
+/// A collection of query results that is serialized as a single result.
+pub struct QueryResults {
+    results: Vec<Arc<QueryResult>>,
+}
+
+impl QueryResults {
+    pub fn empty() -> Self {
+        QueryResults {
+            results: Vec::new(),
+        }
+    }
+
+    pub fn first(&self) -> Option<&Arc<QueryResult>> {
+        self.results.first()
+    }
+}
+
+impl Serialize for QueryResults {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut len = 0;
+        let has_data = self.results.iter().any(|r| r.has_data());
+        if has_data {
+            len += 1;
+        }
+        let has_errors = self.results.iter().any(|r| r.has_errors());
+        if has_errors {
+            len += 1;
+        }
+
+        let mut state = serializer.serialize_struct("QueryResults", len)?;
+
+        // Serialize data.
+        if has_data {
+            struct SerData<'a>(&'a QueryResults);
+
+            impl Serialize for SerData<'_> {
+                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    serialize_value_map(
+                        self.0.results.iter().filter_map(|r| r.data.as_ref()),
+                        serializer,
+                    )
+                }
+            }
+
+            state.serialize_field("data", &SerData(self))?;
+        }
+
+        // Serialize errors.
+        if has_errors {
+            struct SerError<'a>(&'a QueryResults);
+
+            impl Serialize for SerError<'_> {
+                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    let mut seq = serializer.serialize_seq(None)?;
+                    for err in self.0.results.iter().map(|r| &r.errors).flatten() {
+                        seq.serialize_element(err)?;
+                    }
+                    seq.end()
+                }
+            }
+
+            state.serialize_field("errors", &SerError(self))?;
+        }
+
+        state.end()
+    }
+}
+
+impl From<Data> for QueryResults {
+    fn from(x: Data) -> Self {
+        QueryResults {
+            results: vec![Arc::new(x.into())],
+        }
+    }
+}
+
+impl From<QueryResult> for QueryResults {
+    fn from(x: QueryResult) -> Self {
+        QueryResults {
+            results: vec![Arc::new(x)],
+        }
+    }
+}
+
+impl From<Arc<QueryResult>> for QueryResults {
+    fn from(x: Arc<QueryResult>) -> Self {
+        QueryResults { results: vec![x] }
+    }
+}
+
+impl From<QueryExecutionError> for QueryResults {
+    fn from(x: QueryExecutionError) -> Self {
+        QueryResults {
+            results: vec![Arc::new(x.into())],
+        }
+    }
+}
+
+impl From<Vec<QueryExecutionError>> for QueryResults {
+    fn from(x: Vec<QueryExecutionError>) -> Self {
+        QueryResults {
+            results: vec![Arc::new(x.into())],
+        }
+    }
+}
+
+impl QueryResults {
+    pub fn append(&mut self, other: Arc<QueryResult>) {
+        self.results.push(other);
+    }
+
+    pub fn as_http_response<T: From<String>>(&self) -> http::Response<T> {
+        let status_code = http::StatusCode::OK;
+        let json =
+            serde_json::to_string(self).expect("Failed to serialize GraphQL response to JSON");
+        http::Response::builder()
+            .status(status_code)
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, User-Agent")
+            .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS, POST")
+            .header(CONTENT_TYPE, "application/json")
+            .body(T::from(json))
+            .unwrap()
+    }
+}
+
 /// The result of running a query, if successful.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct QueryResult {
-    #[serde(
-        skip_serializing_if = "Vec::is_empty",
-        serialize_with = "serialize_value_map"
-    )]
-    data: Vec<Arc<Data>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    errors: Vec<QueryError>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_data"
     )]
-    pub extensions: Option<q::Value>,
+    data: Option<Data>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<QueryError>,
+    #[serde(skip_serializing)]
+    pub deployment: Option<SubgraphDeploymentId>,
 }
 
 impl QueryResult {
-    /// A result with an empty object as the data.
-    pub fn empty() -> Self {
+    pub fn new(data: Data) -> Self {
         QueryResult {
-            data: Vec::new(),
+            data: Some(data),
             errors: Vec::new(),
-            extensions: None,
+            deployment: None,
         }
     }
 
-    pub fn new(data: Vec<Arc<Data>>) -> Self {
-        QueryResult {
-            data,
-            errors: Vec::new(),
-            extensions: None,
+    /// This is really `clone`, but we do not want to implement `Clone`;
+    /// this is only meant for test purposes and should not be used in production
+    /// code since cloning query results can be very expensive
+    #[cfg(debug_assertions)]
+    pub fn duplicate(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            errors: self.errors.clone(),
+            deployment: self.deployment.clone(),
         }
-    }
-
-    pub fn with_extensions(mut self, extensions: BTreeMap<q::Name, q::Value>) -> Self {
-        self.extensions = Some(q::Value::Object(extensions));
-        self
     }
 
     pub fn has_errors(&self) -> bool {
         return !self.errors.is_empty();
     }
 
-    pub fn append(&mut self, other: QueryResult) {
-        // Currently we don't used extensions, the desired behaviour for merging them is tbd.
-        assert!(self.extensions.is_none());
-        assert!(other.extensions.is_none());
-
-        self.data.extend(other.data);
-        self.errors.extend(other.errors);
-    }
-
-    pub fn as_http_response<T: From<String>>(&self) -> http::Response<T> {
-        let status_code = http::StatusCode::OK;
-        let json =
-            serde_json::to_string(&self).expect("Failed to serialize GraphQL response to JSON");
-        http::Response::builder()
-            .status(status_code)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Headers", "Content-Type, User-Agent")
-            .header("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
-            .header("Content-Type", "application/json")
-            .body(T::from(json))
-            .unwrap()
-    }
-
-    /// Combine all the data into one `q::Value`. This method might clone
-    /// all of the data in this result
-    fn take_data(self) -> Option<q::Value> {
-        fn take_or_clone(value: Arc<Data>) -> Data {
-            Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone())
-        }
-
-        if self.data.is_empty() {
-            None
-        } else {
-            let res = self.data.into_iter().fold(Data::new(), |mut acc, value| {
-                let mut value = take_or_clone(value);
-                acc.append(&mut value);
-                acc
-            });
-            Some(q::Value::Object(res))
-        }
-    }
-
     pub fn has_data(&self) -> bool {
-        !self.data.is_empty()
+        self.data.is_some()
     }
 
-    /// Return either the data or the errors for this `QueryResult`. The data
-    /// will be cloned for any of the entries in `self.data` that have a
-    /// reference count greater than 1. If there are errors, the data is ignored.
     pub fn to_result(self) -> Result<Option<q::Value>, Vec<QueryError>> {
         if self.has_errors() {
             Err(self.errors)
         } else {
-            Ok(self.take_data())
+            Ok(self.data.map(|v| q::Value::Object(v)))
         }
+    }
+
+    pub fn take_data(&mut self) -> Option<Data> {
+        self.data.take()
+    }
+
+    pub fn set_data(&mut self, data: Option<Data>) {
+        self.data = data
+    }
+
+    pub fn errors_mut(&mut self) -> &mut Vec<QueryError> {
+        &mut self.errors
     }
 }
 
 impl From<QueryExecutionError> for QueryResult {
     fn from(e: QueryExecutionError) -> Self {
-        let mut result = Self::new(Vec::new());
-        result.errors = vec![QueryError::from(e)];
-        result
+        QueryResult {
+            data: None,
+            errors: vec![e.into()],
+            deployment: None,
+        }
     }
 }
 
 impl From<QueryError> for QueryResult {
     fn from(e: QueryError) -> Self {
         QueryResult {
-            data: Vec::new(),
+            data: None,
             errors: vec![e],
-            extensions: None,
+            deployment: None,
         }
     }
 }
@@ -154,22 +258,16 @@ impl From<QueryError> for QueryResult {
 impl From<Vec<QueryExecutionError>> for QueryResult {
     fn from(e: Vec<QueryExecutionError>) -> Self {
         QueryResult {
-            data: Vec::new(),
+            data: None,
             errors: e.into_iter().map(QueryError::from).collect(),
-            extensions: None,
+            deployment: None,
         }
     }
 }
 
 impl From<Data> for QueryResult {
     fn from(val: Data) -> Self {
-        QueryResult::from(Arc::new(val))
-    }
-}
-
-impl From<Arc<Data>> for QueryResult {
-    fn from(val: Arc<Data>) -> Self {
-        QueryResult::new(vec![val])
+        QueryResult::new(val)
     }
 }
 
@@ -195,18 +293,7 @@ impl<V: Into<QueryResult>, E: Into<QueryResult>> From<Result<V, E>> for QueryRes
 
 impl CacheWeight for QueryResult {
     fn indirect_weight(&self) -> usize {
-        // self.data is  a Vev<Arc<Data>>. For cached `QueryResult`, the
-        // `Arc` is not shared with anything else, and we calculate the
-        // indirect weight as if we had a `Vec<Data>`
-        let data_weight = self
-            .data
-            .iter()
-            .map(Arc::as_ref)
-            .map(CacheWeight::indirect_weight)
-            .sum::<usize>()
-            + self.data.capacity() * std::mem::size_of::<Arc<Data>>();
-
-        data_weight + self.errors.indirect_weight() + self.extensions.indirect_weight()
+        self.data.indirect_weight() + self.errors.indirect_weight()
     }
 }
 
@@ -216,16 +303,18 @@ impl CacheWeight for QueryResult {
 fn multiple_data_items() {
     use serde_json::json;
 
-    fn make_obj(key: &str, value: &str) -> Arc<Data> {
+    fn make_obj(key: &str, value: &str) -> Arc<QueryResult> {
         let mut map = BTreeMap::new();
         map.insert(key.to_owned(), q::Value::String(value.to_owned()));
-        Arc::new(map)
+        Arc::new(map.into())
     }
 
     let obj1 = make_obj("key1", "value1");
     let obj2 = make_obj("key2", "value2");
 
-    let res = QueryResult::new(vec![obj1, obj2]);
+    let mut res = QueryResults::empty();
+    res.append(obj1);
+    res.append(obj2);
 
     let expected =
         serde_json::to_string(&json!({"data":{"key1": "value1", "key2": "value2"}})).unwrap();

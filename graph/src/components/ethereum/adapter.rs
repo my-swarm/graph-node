@@ -1,5 +1,5 @@
+use anyhow::{anyhow, Error};
 use ethabi::{Bytes, Error as ABIError, Function, ParamType, Token};
-use failure::SyncFailure;
 use futures::Future;
 use futures03::future::TryFutureExt;
 use mockall::predicate::*;
@@ -9,8 +9,9 @@ use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::Unpin;
+use thiserror::Error;
 use tiny_keccak::keccak256;
-use web3::types::*;
+use web3::types::{Address, Block, Log, H2048, H256};
 
 use super::types::*;
 use crate::components::metrics::{CounterVec, GaugeVec, HistogramVec};
@@ -18,6 +19,7 @@ use crate::prelude::*;
 
 pub type EventSignature = H256;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 /// A collection of attributes that (kind of) uniquely identify an Ethereum blockchain.
 pub struct EthereumNetworkIdentifier {
     pub net_version: String,
@@ -50,41 +52,38 @@ pub struct EthereumContractCall {
     pub args: Vec<Token>,
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum EthereumContractCallError {
-    #[fail(display = "ABI error: {}", _0)]
-    ABIError(SyncFailure<ABIError>),
+    #[error("ABI error: {0}")]
+    ABIError(ABIError),
     /// `Token` is not of expected `ParamType`
-    #[fail(display = "type mismatch, token {:?} is not of kind {:?}", _0, _1)]
+    #[error("type mismatch, token {0:?} is not of kind {0:?}")]
     TypeError(Token, ParamType),
-    #[fail(display = "error encoding input call data: {}", _0)]
+    #[error("error encoding input call data: {0}")]
     EncodingError(ethabi::Error),
-    #[fail(display = "call error: {}", _0)]
+    #[error("call error: {0}")]
     Web3Error(web3::Error),
-    #[fail(display = "call reverted: {}", _0)]
+    #[error("call reverted: {0}")]
     Revert(String),
-    #[fail(display = "ethereum node took too long to perform call")]
+    #[error("ethereum node took too long to perform call")]
     Timeout,
 }
 
 impl From<ABIError> for EthereumContractCallError {
     fn from(e: ABIError) -> Self {
-        EthereumContractCallError::ABIError(SyncFailure::new(e))
+        EthereumContractCallError::ABIError(e)
     }
 }
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 pub enum EthereumAdapterError {
     /// The Ethereum node does not know about this block for some reason, probably because it
     /// disappeared in a chain reorg.
-    #[fail(
-        display = "Block data unavailable, block was likely uncled (block hash = {:?})",
-        _0
-    )]
+    #[error("Block data unavailable, block was likely uncled (block hash = {0:?})")]
     BlockUnavailable(H256),
 
     /// An unexpected error occurred.
-    #[fail(display = "Ethereum adapter error: {}", _0)]
+    #[error("Ethereum adapter error: {0}")]
     Unknown(Error),
 }
 
@@ -279,7 +278,7 @@ impl EthereumLogFilter {
 pub struct EthereumCallFilter {
     // Each call filter has a map of filters keyed by address, each containing a tuple with
     // start_block and the set of function signatures
-    pub contract_addresses_function_signatures: HashMap<Address, (u64, HashSet<[u8; 4]>)>,
+    pub contract_addresses_function_signatures: HashMap<Address, (BlockNumber, HashSet<[u8; 4]>)>,
 }
 
 impl EthereumCallFilter {
@@ -362,22 +361,14 @@ impl EthereumCallFilter {
         } = self;
         contract_addresses_function_signatures.is_empty()
     }
-
-    pub fn start_blocks(&self) -> Vec<u64> {
-        self.contract_addresses_function_signatures
-            .values()
-            .filter(|(start_block, _fn_sigs)| start_block > &0)
-            .map(|(start_block, _fn_sigs)| *start_block)
-            .collect()
-    }
 }
 
-impl FromIterator<(u64, Address, [u8; 4])> for EthereumCallFilter {
+impl FromIterator<(BlockNumber, Address, [u8; 4])> for EthereumCallFilter {
     fn from_iter<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = (u64, Address, [u8; 4])>,
+        I: IntoIterator<Item = (BlockNumber, Address, [u8; 4])>,
     {
-        let mut lookup: HashMap<Address, (u64, HashSet<[u8; 4]>)> = HashMap::new();
+        let mut lookup: HashMap<Address, (BlockNumber, HashSet<[u8; 4]>)> = HashMap::new();
         iter.into_iter()
             .for_each(|(start_block, address, function_signature)| {
                 if !lookup.contains_key(&address) {
@@ -404,14 +395,14 @@ impl From<EthereumBlockFilter> for EthereumCallFilter {
                 .contract_addresses
                 .into_iter()
                 .map(|(start_block_opt, address)| (address, (start_block_opt, HashSet::default())))
-                .collect::<HashMap<Address, (u64, HashSet<[u8; 4]>)>>(),
+                .collect::<HashMap<Address, (BlockNumber, HashSet<[u8; 4]>)>>(),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct EthereumBlockFilter {
-    pub contract_addresses: HashSet<(u64, Address)>,
+    pub contract_addresses: HashSet<(BlockNumber, Address)>,
     pub trigger_every_block: bool,
 }
 
@@ -475,15 +466,6 @@ impl EthereumBlockFilter {
                 addresses
             },
         );
-    }
-
-    pub fn start_blocks(&self) -> Vec<u64> {
-        self.contract_addresses
-            .iter()
-            .cloned()
-            .filter(|(start_block, _fn_sigs)| start_block > &0)
-            .map(|(start_block, _fn_sigs)| start_block)
-            .collect()
     }
 }
 
@@ -611,15 +593,16 @@ impl BlockStreamMetrics {
 /// Implementations may be implemented against an in-process Ethereum node
 /// or a remote node over RPC.
 #[automock]
+#[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
     fn url_hostname(&self) -> &str;
 
+    /// The `provider.label` from the adapter's configuration
+    fn provider(&self) -> &str;
+
     /// Ask the Ethereum node for some identifying information about the Ethereum network it is
     /// connected to.
-    fn net_identifiers(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = EthereumNetworkIdentifier, Error = Error> + Send>;
+    async fn net_identifiers(&self) -> Result<EthereumNetworkIdentifier, Error>;
 
     /// Get the latest block, including full transactions.
     fn latest_block(
@@ -652,8 +635,8 @@ pub trait EthereumAdapter: Send + Sync + 'static {
     fn block_range_to_ptrs(
         &self,
         logger: Logger,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
     ) -> Box<dyn Future<Item = Vec<EthereumBlockPointer>, Error = Error> + Send>;
 
     /// Find a block by its hash.
@@ -666,7 +649,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
     fn block_by_number(
         &self,
         logger: &Logger,
-        block_number: u64,
+        block_number: BlockNumber,
     ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send>;
 
     /// Load full information for the specified `block` (in particular, transaction receipts).
@@ -681,7 +664,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         chain_store: Arc<dyn ChainStore>,
-        block_number: u64,
+        block_number: BlockNumber,
     ) -> Box<dyn Future<Item = EthereumBlockPointer, Error = EthereumAdapterError> + Send>;
 
     /// Find a block by its number. The `block_is_final` flag indicates whether
@@ -702,7 +685,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         chain_store: Arc<dyn ChainStore>,
-        block_number: u64,
+        block_number: BlockNumber,
         block_is_final: bool,
     ) -> Box<dyn Future<Item = Option<H256>, Error = Error> + Send>;
 
@@ -735,7 +718,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        block_number: u64,
+        block_number: BlockNumber,
         block_hash: H256,
     ) -> Box<dyn Future<Item = Vec<EthereumCall>, Error = Error> + Send>;
 
@@ -743,8 +726,8 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         log_filter: EthereumLogFilter,
     ) -> DynTryFuture<'static, Vec<Log>, Error>;
 
@@ -752,8 +735,8 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         &self,
         logger: &Logger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-        from: u64,
-        to: u64,
+        from: BlockNumber,
+        to: BlockNumber,
         call_filter: EthereumCallFilter,
     ) -> Box<dyn Stream<Item = EthereumCall, Error = Error> + Send>;
 
@@ -779,7 +762,7 @@ fn parse_log_triggers(
                 .logs
                 .iter()
                 .filter(move |log| log_filter.matches(log))
-                .map(move |log| EthereumTrigger::Log(log.clone()))
+                .map(move |log| EthereumTrigger::Log(Arc::new(log.clone())))
         })
         .collect()
 }
@@ -792,7 +775,7 @@ fn parse_call_triggers(
         .calls
         .iter()
         .filter(move |call| call_filter.matches(call))
-        .map(move |call| EthereumTrigger::Call(call.clone()))
+        .map(move |call| EthereumTrigger::Call(Arc::new(call.clone())))
         .collect()
 }
 
@@ -803,12 +786,16 @@ fn parse_block_triggers(
     let block_ptr = EthereumBlockPointer::from(&block.ethereum_block);
     let trigger_every_block = block_filter.trigger_every_block;
     let call_filter = EthereumCallFilter::from(block_filter);
+    let block_ptr2 = block_ptr.cheap_clone();
     let mut triggers = block
         .calls
         .iter()
         .filter(move |call| call_filter.matches(call))
         .map(move |call| {
-            EthereumTrigger::Block(block_ptr, EthereumBlockTriggerType::WithCallTo(call.to))
+            EthereumTrigger::Block(
+                block_ptr2.clone(),
+                EthereumBlockTriggerType::WithCallTo(call.to),
+            )
         })
         .collect::<Vec<EthereumTrigger>>();
     if trigger_every_block {
@@ -832,13 +819,14 @@ pub async fn triggers_in_block(
 ) -> Result<EthereumBlockWithTriggers, Error> {
     match &ethereum_block {
         BlockFinality::Final(block) => {
+            let block_number = block.number() as BlockNumber;
             let mut blocks = blocks_with_triggers(
                 adapter,
                 logger,
                 chain_store,
                 subgraph_metrics,
-                block.number(),
-                block.number(),
+                block_number,
+                block_number,
                 log_filter,
                 call_filter,
                 block_filter,
@@ -881,8 +869,8 @@ pub async fn blocks_with_triggers(
     logger: Logger,
     chain_store: Arc<dyn ChainStore>,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-    from: u64,
-    to: u64,
+    from: BlockNumber,
+    to: BlockNumber,
     log_filter: EthereumLogFilter,
     call_filter: EthereumCallFilter,
     block_filter: EthereumBlockFilter,
@@ -899,7 +887,12 @@ pub async fn blocks_with_triggers(
     if !log_filter.is_empty() {
         trigger_futs.push(Box::new(
             eth.logs_in_block_range(&logger, subgraph_metrics.clone(), from, to, log_filter)
-                .map_ok(|logs: Vec<Log>| logs.into_iter().map(EthereumTrigger::Log).collect())
+                .map_ok(|logs: Vec<Log>| {
+                    logs.into_iter()
+                        .map(Arc::new)
+                        .map(EthereumTrigger::Log)
+                        .collect()
+                })
                 .compat(),
         ))
     }
@@ -907,6 +900,7 @@ pub async fn blocks_with_triggers(
     if !call_filter.is_empty() {
         trigger_futs.push(Box::new(
             eth.calls_in_block_range(&logger, subgraph_metrics.clone(), from, to, call_filter)
+                .map(Arc::new)
                 .map(EthereumTrigger::Call)
                 .collect(),
         ));
@@ -954,7 +948,7 @@ pub async fn blocks_with_triggers(
                                 "Ethereum endpoint is behind";
                                 "url" => eth_clone.url_hostname()
                         );
-                        format_err!("Block {} not found in the chain", to)
+                        anyhow!("Block {} not found in the chain", to)
                     }),
                     Err(e) => Err(e),
                 }),
@@ -964,7 +958,7 @@ pub async fn blocks_with_triggers(
 
     let mut block_hashes: HashSet<H256> =
         triggers.iter().map(EthereumTrigger::block_hash).collect();
-    let mut triggers_by_block: HashMap<u64, Vec<EthereumTrigger>> =
+    let mut triggers_by_block: HashMap<BlockNumber, Vec<EthereumTrigger>> =
         triggers.into_iter().fold(HashMap::new(), |mut map, t| {
             map.entry(t.block_number()).or_default().push(t);
             map
@@ -979,12 +973,12 @@ pub async fn blocks_with_triggers(
     let mut blocks = adapter
         .load_blocks(logger1, chain_store, block_hashes)
         .and_then(
-            move |block| match triggers_by_block.remove(&block.number()) {
+            move |block| match triggers_by_block.remove(&(block.number() as BlockNumber)) {
                 Some(triggers) => Ok(EthereumBlockWithTriggers::new(
                     triggers,
                     BlockFinality::Final(block),
                 )),
-                None => Err(format_err!(
+                None => Err(anyhow!(
                     "block {:?} not found in `triggers_by_block`",
                     block
                 )),
@@ -998,17 +992,17 @@ pub async fn blocks_with_triggers(
 
     // Sanity check that the returned blocks are in the correct range.
     // Unwrap: `blocks` always includes at least `to`.
-    let first = blocks.first().unwrap().ethereum_block.number();
-    let last = blocks.last().unwrap().ethereum_block.number();
+    let first = blocks.first().unwrap().ethereum_block.number() as BlockNumber;
+    let last = blocks.last().unwrap().ethereum_block.number() as BlockNumber;
     if first < from {
-        return Err(format_err!(
+        return Err(anyhow!(
             "block {} returned by the Ethereum node is before {}, the first block of the requested range",
             first,
             from,
         ));
     }
     if last > to {
-        return Err(format_err!(
+        return Err(anyhow!(
             "block {} returned by the Ethereum node is after {}, the last block of the requested range",
             last,
             to,

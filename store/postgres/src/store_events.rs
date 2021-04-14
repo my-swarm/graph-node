@@ -1,19 +1,22 @@
 use futures::sync::mpsc::{channel, Sender};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{atomic::Ordering, Arc, Mutex, RwLock};
+use std::{collections::HashMap, sync::atomic::AtomicUsize};
 use uuid::Uuid;
 
 use crate::notification_listener::{NotificationListener, SafeChannelName};
+use graph::components::store::SubscriptionManager as SubscriptionManagerTrait;
 use graph::prelude::serde_json;
 use graph::prelude::*;
 
 pub struct StoreEventListener {
+    logger: Logger,
     notification_listener: NotificationListener,
 }
 
 impl StoreEventListener {
     pub fn new(logger: &Logger, postgres_url: String) -> Self {
         StoreEventListener {
+            logger: logger.clone(),
             notification_listener: NotificationListener::new(
                 logger,
                 postgres_url,
@@ -33,17 +36,36 @@ impl EventProducer<StoreEvent> for StoreEventListener {
     ) -> Option<Box<dyn Stream<Item = StoreEvent, Error = ()> + Send>> {
         self.notification_listener.take_event_stream().map(
             |stream| -> Box<dyn Stream<Item = _, Error = _> + Send> {
-                Box::new(stream.map(|notification| {
-                    // Create StoreEvent from JSON
-                    let change: StoreEvent = serde_json::from_value(notification.payload.clone())
-                        .unwrap_or_else(|_| {
-                            panic!(
+                let logger = self.logger.clone();
+                Box::new(stream.filter_map(move |notification| {
+                    // When graph-node is starting up, it is possible that
+                    // Postgres still has old messages queued up that we
+                    // can't decode anymore. It is safe to skip them; once
+                    // We've seen 10 valid messages, we can assume that
+                    // whatever old messages Postgres had queued have been
+                    // cleared. Seeing an invalid message after that
+                    // definitely indicates trouble.
+                    let num_valid = AtomicUsize::new(0);
+                    serde_json::from_value(notification.payload.clone()).map_or_else(
+                        |_err| {
+                            error!(
+                                &logger,
                                 "invalid store event received from database: {:?}",
                                 notification.payload
-                            )
-                        });
-
-                    change
+                            );
+                            if num_valid.load(Ordering::SeqCst) > 10 {
+                                panic!(
+                                    "invalid store event received from database: {:?}",
+                                    notification.payload
+                                );
+                            }
+                            None
+                        },
+                        |change| {
+                            num_valid.fetch_add(1, Ordering::SeqCst);
+                            Some(change)
+                        },
+                    )
                 }))
             },
         )
@@ -122,13 +144,13 @@ impl SubscriptionManager {
     }
 
     fn periodically_clean_up_stale_subscriptions(&self) {
-        use futures03::stream::StreamExt;
-
         let subscriptions = self.subscriptions.clone();
 
         // Clean up stale subscriptions every 5s
-        graph::spawn(
-            tokio::time::interval(Duration::from_secs(5)).for_each(move |_| {
+        graph::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
                 let mut subscriptions = subscriptions.write().unwrap();
 
                 // Obtain IDs of subscriptions whose receiving end has gone
@@ -144,13 +166,13 @@ impl SubscriptionManager {
                 for id in stale_ids {
                     subscriptions.remove(&id);
                 }
-
-                futures03::future::ready(())
-            }),
-        );
+            }
+        });
     }
+}
 
-    pub fn subscribe(&self, entities: Vec<SubgraphEntityPair>) -> StoreEventStreamBox {
+impl SubscriptionManagerTrait for SubscriptionManager {
+    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
         let id = Uuid::new_v4().to_string();
 
         // Prepare the new subscription by creating a channel and a subscription object

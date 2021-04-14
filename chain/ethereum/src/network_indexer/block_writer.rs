@@ -43,7 +43,7 @@ pub struct BlockWriter {
     logger: Logger,
 
     /// Store that manages the network subgraph.
-    store: Arc<dyn Store>,
+    store: Arc<dyn SubgraphStore>,
 
     /// Metrics for analyzing the block writer performance.
     metrics: Arc<BlockWriterMetrics>,
@@ -54,7 +54,7 @@ impl BlockWriter {
     pub fn new(
         subgraph_id: SubgraphDeploymentId,
         logger: &Logger,
-        store: Arc<dyn Store>,
+        store: Arc<dyn SubgraphStore>,
         stopwatch: StopwatchMetrics,
         metrics_registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
@@ -97,7 +97,7 @@ impl BlockWriter {
 struct WriteContext {
     logger: Logger,
     subgraph_id: SubgraphDeploymentId,
-    store: Arc<dyn Store>,
+    store: Arc<dyn SubgraphStore>,
     cache: EntityCache,
     metrics: Arc<BlockWriterMetrics>,
 }
@@ -109,16 +109,13 @@ type WriteContextResult = Box<dyn Future<Item = WriteContext, Error = Error> + S
 impl WriteContext {
     /// Updates an entity to a new value (potentially merging it with existing data).
     fn set_entity(mut self, value: impl TryIntoEntity + ToEntityKey) -> WriteContextResult {
-        self.cache
-            .set(
-                value.to_entity_key(self.subgraph_id.clone()),
-                match value.try_into_entity() {
-                    Ok(entity) => entity,
-                    Err(e) => return Box::new(future::err(e.into())),
-                },
-            )
-            // An error here is only possible if entities ever get removed, which is not the case.
-            .unwrap();
+        self.cache.set(
+            value.to_entity_key(self.subgraph_id.clone()),
+            match value.try_into_entity() {
+                Ok(entity) => entity,
+                Err(e) => return Box::new(future::err(e.into())),
+            },
+        );
         Box::new(future::ok(self))
     }
 
@@ -168,6 +165,8 @@ impl WriteContext {
                                 block_ptr.clone(),
                                 modifications,
                                 stopwatch,
+                                Vec::new(),
+                                Vec::new(),
                             )
                             .map_err(|e| e.into())
                             .map(move |_| {

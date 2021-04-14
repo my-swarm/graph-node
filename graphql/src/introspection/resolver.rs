@@ -1,7 +1,7 @@
-use graphql_parser::{query as q, schema as s, Pos};
+use graphql_parser::Pos;
 use std::collections::{BTreeMap, HashMap};
 
-use graph::data::graphql::ObjectOrInterface;
+use graph::data::graphql::{object, ObjectOrInterface};
 use graph::prelude::*;
 
 use crate::prelude::*;
@@ -129,7 +129,7 @@ fn interface_type_object(
         description: interface_type.description.clone(),
         fields:
             field_objects(schema, type_objects, &interface_type.fields),
-        possibleTypes: schema.types_for_interface()[&interface_type.name]
+        possibleTypes: schema.types_for_interface()[&interface_type.into()]
             .iter()
             .map(|object_type| q::Value::String(object_type.name.to_owned()))
             .collect::<Vec<_>>(),
@@ -189,7 +189,7 @@ fn object_interfaces(
 ) -> q::Value {
     q::Value::List(
         schema
-            .interfaces_for_type(&object_type.name)
+            .interfaces_for_type(&object_type.into())
             .unwrap_or(&vec![])
             .iter()
             .map(|typedef| interface_type_object(schema, type_objects, typedef))
@@ -365,7 +365,7 @@ impl Resolver for IntrospectionResolver {
         field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         match field.name.as_str() {
             "possibleTypes" => {
@@ -400,7 +400,7 @@ impl Resolver for IntrospectionResolver {
         field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&q::Name, q::Value>,
+        arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         let object = match field.name.as_str() {
             "__schema" => self.schema_object(),

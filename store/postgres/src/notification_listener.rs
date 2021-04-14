@@ -1,10 +1,9 @@
 use crate::functions::pg_notify;
 use diesel::pg::PgConnection;
 use diesel::select;
-use fallible_iterator::FallibleIterator;
 use lazy_static::lazy_static;
-use postgres::notification::Notification;
-use postgres::{Connection, TlsMode};
+use postgres::Notification;
+use postgres::{fallible_iterator::FallibleIterator, Client, NoTls};
 use std::env;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +27,7 @@ lazy_static! {
             .unwrap_or(Duration::from_secs(300));
 }
 
+#[derive(Clone)]
 /// This newtype exists to make it hard to misuse the `NotificationListener` API in a way that
 /// could impact security.
 pub struct SafeChannelName(String);
@@ -44,6 +44,10 @@ impl SafeChannelName {
     /// by an attacker.
     pub fn i_promise_this_is_safe(channel_name: impl Into<String>) -> Self {
         SafeChannelName(channel_name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -118,11 +122,11 @@ impl NotificationListener {
             // We exit the process on panic so unwind safety is irrelevant.
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 // Connect to Postgres
-                let conn = Connection::connect(postgres_url, TlsMode::None)
+                let mut conn = Client::connect(postgres_url.as_str(), NoTls)
                     .expect("failed to connect notification listener to Postgres");
 
                 // Subscribe to the notification channel in Postgres
-                conn.execute(&format!("LISTEN {}", channel_name.0), &[])
+                conn.execute(format!("LISTEN {}", channel_name.0).as_str(), &[])
                     .expect("failed to listen to Postgres notifications");
 
                 // Wait until the listener has been started
@@ -130,11 +134,18 @@ impl NotificationListener {
 
                 // Read notifications until the thread is to be terminated
                 while !terminate.load(Ordering::SeqCst) {
-                    // Obtain a notifications iterator from Postgres
-                    let notifications = conn.notifications();
-
-                    // Read notifications until there hasn't been one for 500ms
-                    for notification in notifications
+                    // Obtain pending notifications from Postgres. We load
+                    // them all into memory, since for large notifications
+                    // we need to query the database again; avoiding this
+                    // load would require that we use a second database
+                    // connection to look up large notifications
+                    //
+                    // We batch notifications such that we do not wait for
+                    // longer than 500ms for new notifications to arrive,
+                    // but limit the size of each batch to 64 to guarantee
+                    // progress on a busy system
+                    let notifications: Vec<_> = conn
+                        .notifications()
                         .timeout_iter(Duration::from_millis(500))
                         .iterator()
                         .filter_map(|item| match item {
@@ -144,20 +155,24 @@ impl NotificationListener {
                                 crit!(logger, "Error receiving message"; "error" => &msg);
                                 eprintln!(
                                     "Connection to Postgres lost while listening for events. \
-                                 Aborting to avoid inconsistent state. ({})",
+                             Aborting to avoid inconsistent state. ({})",
                                     msg
                                 );
                                 std::process::abort();
                             }
                         })
-                        .filter(|notification| notification.channel == channel_name.0)
-                    {
+                        .filter(|notification| notification.channel() == channel_name.0)
+                        .take(64)
+                        .collect();
+
+                    // Read notifications until there hasn't been one for 500ms
+                    for notification in notifications {
                         // Terminate the thread if desired
                         if terminate.load(Ordering::SeqCst) {
                             break;
                         }
 
-                        match JsonNotification::parse(&notification, &conn) {
+                        match JsonNotification::parse(&notification, &mut conn) {
                             Ok(json_notification) => {
                                 // We'll assume here that if sending fails, this means that the
                                 // listener has already been dropped, the receiving
@@ -209,6 +224,16 @@ impl EventProducer<JsonNotification> for NotificationListener {
     }
 }
 
+mod public {
+    table! {
+        large_notifications(id) {
+            id -> Integer,
+            payload -> Text,
+            created_at -> Timestamp,
+        }
+    }
+}
+
 // A utility to send JSON notifications that may be larger than the
 // 8000 bytes limit for Postgres NOTIFY payloads. Large notifications
 // are written to the `large_notifications` table and their ID is sent
@@ -230,19 +255,19 @@ static LARGE_NOTIFICATION_THRESHOLD: usize = 7800;
 impl JsonNotification {
     pub fn parse(
         notification: &Notification,
-        conn: &Connection,
+        conn: &mut Client,
     ) -> Result<JsonNotification, StoreError> {
-        let value = serde_json::from_str(&notification.payload)?;
+        let value = serde_json::from_str(&notification.payload())?;
 
         match value {
             serde_json::Value::Number(n) => {
                 let payload_id: i64 = n.as_i64().ok_or_else(|| {
-                    format_err!("Invalid notification ID, not compatible with i64: {}", n)
+                    anyhow!("Invalid notification ID, not compatible with i64: {}", n)
                 })?;
 
                 if payload_id < (i32::min_value() as i64) || payload_id > (i32::max_value() as i64)
                 {
-                    Err(format_err!(
+                    Err(anyhow!(
                         "Invalid notification ID, value exceeds i32: {}",
                         payload_id
                     ))?;
@@ -254,33 +279,30 @@ impl JsonNotification {
                         &[&(payload_id as i32)],
                     )
                     .map_err(|e| {
-                        format_err!(
+                        anyhow!(
                             "Error retrieving payload for notification {}: {}",
                             payload_id,
                             e
                         )
                     })?;
 
-                if payload_rows.is_empty() || payload_rows.get(0).is_empty() {
-                    return Err(format_err!(
-                        "No payload found for notification {}",
-                        payload_id
-                    ))?;
+                if payload_rows.is_empty() || payload_rows.get(0).is_none() {
+                    return Err(anyhow!("No payload found for notification {}", payload_id))?;
                 }
-                let payload: String = payload_rows.get(0).get(0);
+                let payload: String = payload_rows.get(0).unwrap().get(0);
 
                 Ok(JsonNotification {
-                    process_id: notification.process_id,
-                    channel: notification.channel.clone(),
+                    process_id: notification.process_id(),
+                    channel: notification.channel().to_string(),
                     payload: serde_json::from_str(&payload)?,
                 })
             }
             serde_json::Value::Object(_) => Ok(JsonNotification {
-                process_id: notification.process_id,
-                channel: notification.channel.clone(),
+                process_id: notification.process_id(),
+                channel: notification.channel().to_string(),
                 payload: value,
             }),
-            _ => Err(format_err!("JSON notifications must be numbers or objects"))?,
+            _ => Err(anyhow!("JSON notifications must be numbers or objects"))?,
         }
     }
 
@@ -289,9 +311,9 @@ impl JsonNotification {
         data: &serde_json::Value,
         conn: &PgConnection,
     ) -> Result<(), StoreError> {
-        use crate::db_schema::large_notifications::dsl::*;
         use diesel::ExpressionMethods;
         use diesel::RunQueryDsl;
+        use public::large_notifications::dsl::*;
 
         let msg = data.to_string();
 

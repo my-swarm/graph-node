@@ -7,7 +7,7 @@ let one = BigDecimal.fromString("1");
 export function handleTrigger(event: Trigger): void {
   // There are 35 digits after the dot.
   // big_decimal exponent will be: -35 - 6109 = -6144.
-  // Minmum exponent is: -6143.
+  // Minimum exponent is: -6143.
   // So 1 digit will be removed, the 8, and the 6 will be rounded to 7.
   let small = BigDecimal.fromString("0.99999999999999999999999999999999968");
 
@@ -43,4 +43,23 @@ export function handleTrigger(event: Trigger): void {
 
   // Test big decimal division.
   assert(one / BigDecimal.fromString("10") == BigDecimal.fromString("0.1"));
+
+  // Test big int fromString
+  assert(BigInt.fromString("8888") == BigInt.fromI32(8888));
+
+  let bigInt = BigInt.fromString("8888888888888888");
+
+  // Test big int bit or
+  assert(
+    (bigInt | BigInt.fromI32(42)) == BigInt.fromString("8888888888888890")
+  );
+
+  // Test big int bit and
+  assert((bigInt & BigInt.fromI32(42)) == BigInt.fromI32(40));
+
+  // Test big int left shift
+  assert(bigInt << 6 == BigInt.fromString("568888888888888832"));
+
+  // Test big int right shift
+  assert(bigInt >> 6 == BigInt.fromString("138888888888888"));
 }

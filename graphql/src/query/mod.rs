@@ -1,5 +1,4 @@
-use graph::prelude::{CheapClone, EthereumBlockPointer, QueryExecutionError, QueryResult};
-use graphql_parser::query as q;
+use graph::prelude::{q, CheapClone, EthereumBlockPointer, QueryExecutionError, QueryResult};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,7 +70,7 @@ where
         ctx.cheap_clone(),
         selection_set.cheap_clone(),
         query_type,
-        block_ptr,
+        block_ptr.clone(),
     )
     .await;
     let elapsed = start.elapsed();

@@ -24,11 +24,12 @@ fn node_fails_to_start_with_unnamed_ethereum_network() {
         .fails()
         .and()
         .stderr()
-        .contains("Failed to parse Ethereum networks: Is your Ethereum node string missing a network name? Try 'mainnet:' + the Ethereum node URL.")
+        .contains("configuration error: Is your Ethereum node string missing a network name? Try 'mainnet:' + the Ethereum node URL.")
         .unwrap()
 }
 
 #[test]
+#[ignore = "non deterministic"]
 fn node_fails_to_start_with_invalid_ipfs() {
     assert_cli::Assert::main_binary()
         .with_args(&[

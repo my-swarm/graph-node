@@ -2,9 +2,9 @@
 
 use pretty_assertions::assert_eq;
 
-use graph::prelude::*;
-use graph_graphql::prelude::object;
-use graphql_parser::query as q;
+use graph::prelude::q;
+use graph::{components::store::EntityType, data::graphql::object};
+use graph::{data::query::QueryTarget, prelude::*};
 use test_store::*;
 
 // `entities` is `(entity, type)`.
@@ -14,42 +14,41 @@ fn insert_and_query(
     entities: Vec<(Entity, &str)>,
     query: &str,
 ) -> Result<QueryResult, StoreError> {
-    create_test_subgraph(subgraph_id, schema);
     let subgraph_id = SubgraphDeploymentId::new(subgraph_id).unwrap();
+    create_test_subgraph(&subgraph_id, schema);
 
     let insert_ops = entities
         .into_iter()
         .map(|(data, entity_type)| EntityOperation::Set {
             key: EntityKey {
                 subgraph_id: subgraph_id.clone(),
-                entity_type: entity_type.to_owned(),
+                entity_type: EntityType::new(entity_type.to_owned()),
                 entity_id: data["id"].clone().as_string().unwrap(),
             },
             data,
         });
 
     transact_entity_operations(
-        &STORE,
+        &STORE.subgraph_store(),
         subgraph_id.clone(),
         GENESIS_PTR.clone(),
         insert_ops.collect::<Vec<_>>(),
     )?;
 
-    let document = graphql_parser::parse_query(query).unwrap();
-    let query = Query::new(
-        STORE.api_schema(&subgraph_id).unwrap(),
-        document,
-        None,
-        STORE.network_name(&subgraph_id).unwrap(),
-    );
-    Ok(execute_subgraph_query(query))
+    let document = graphql_parser::parse_query(query).unwrap().into_static();
+    let target = QueryTarget::Deployment(subgraph_id);
+    let query = Query::new(document, None);
+    Ok(execute_subgraph_query(query, target)
+        .first()
+        .unwrap()
+        .duplicate())
 }
 
 /// Extract the data from a `QueryResult`, and panic if it has errors
 macro_rules! extract_data {
     ($result: expr) => {
         match $result.to_result() {
-            Err(errors) => panic!(format!("Unexpected errors return for query: {:#?}", errors)),
+            Err(errors) => panic!("Unexpected errors return for query: {:#?}", errors),
             Ok(data) => data,
         }
     };

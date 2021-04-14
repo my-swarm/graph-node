@@ -4,9 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use graph::components::link_resolver::{JsonValueStream, LinkResolver as LinkResolverTrait};
+use graph::components::{
+    link_resolver::{JsonValueStream, LinkResolver as LinkResolverTrait},
+    store::EntityType,
+};
 use graph::prelude::{
-    Entity, Link, SubgraphDeploymentId, SubgraphManifest, SubgraphManifestValidationError,
+    anyhow, Entity, Link, SubgraphDeploymentId, SubgraphManifest, SubgraphManifestValidationError,
     UnvalidatedSubgraphManifest,
 };
 
@@ -33,10 +36,10 @@ impl LinkResolverTrait for TextResolver {
         self
     }
 
-    async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, failure::Error> {
+    async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, anyhow::Error> {
         self.texts
             .get(&link.link)
-            .ok_or(failure::format_err!("No text for {}", &link.link))
+            .ok_or(anyhow!("No text for {}", &link.link))
             .map(|text| text.to_owned().into_bytes())
     }
 
@@ -44,7 +47,7 @@ impl LinkResolverTrait for TextResolver {
         &self,
         _logger: &Logger,
         _link: &Link,
-    ) -> Result<JsonValueStream, failure::Error> {
+    ) -> Result<JsonValueStream, anyhow::Error> {
         unimplemented!()
     }
 }
@@ -57,26 +60,26 @@ const MAPPING: &str = "export function handleGet(call: getCall): void {}";
 
 async fn resolve_manifest(text: &str) -> SubgraphManifest {
     let mut resolver = TextResolver::default();
-    let link = Link::from("/ipfs/Qmmanifest".to_owned());
+    let id = SubgraphDeploymentId::new("Qmmanifest").unwrap();
 
-    resolver.add(link.link.as_str(), text);
+    resolver.add(id.as_str(), text);
     resolver.add("/ipfs/Qmschema", GQL_SCHEMA);
     resolver.add("/ipfs/Qmabi", ABI);
     resolver.add("/ipfs/Qmmapping", MAPPING);
 
-    SubgraphManifest::resolve(link, &resolver, &LOGGER)
+    SubgraphManifest::resolve(id, &resolver, &LOGGER)
         .await
         .expect("Parsing simple manifest works")
 }
 
 async fn resolve_unvalidated(text: &str) -> UnvalidatedSubgraphManifest {
     let mut resolver = TextResolver::default();
-    let link = Link::from("/ipfs/Qmmanifest".to_owned());
+    let id = SubgraphDeploymentId::new("Qmmanifest").unwrap();
 
-    resolver.add(link.link.as_str(), text);
+    resolver.add(id.as_str(), text);
     resolver.add("/ipfs/Qmschema", GQL_SCHEMA);
 
-    UnvalidatedSubgraphManifest::resolve(link, Arc::new(resolver), &LOGGER)
+    UnvalidatedSubgraphManifest::resolve(id, Arc::new(resolver), &LOGGER)
         .await
         .expect("Parsing simple manifest works")
 }
@@ -88,7 +91,7 @@ dataSources: []
 schema:
   file:
     /: /ipfs/Qmschema
-specVersion: 0.0.1
+specVersion: 0.0.2
 ";
 
     let manifest = resolve_manifest(YAML).await;
@@ -107,7 +110,7 @@ schema:
 graft:
   base: Qmbase
   block: 12345
-specVersion: 0.0.1
+specVersion: 0.0.2
 ";
 
     let manifest = resolve_manifest(YAML).await;
@@ -128,10 +131,10 @@ schema:
 graft:
   base: Qmbase
   block: 1
-specVersion: 0.0.1
+specVersion: 0.0.2
 ";
 
-    let store = test_store::STORE.clone();
+    let store = test_store::STORE.subgraph_store();
 
     test_store::STORE_RUNTIME.lock().unwrap().block_on(async {
         let unvalidated = resolve_unvalidated(YAML).await;
@@ -140,7 +143,7 @@ specVersion: 0.0.1
         //
         // Validation against subgraph that hasn't synced anything fails
         //
-        test_store::create_test_subgraph(subgraph.as_str(), GQL_SCHEMA);
+        test_store::create_test_subgraph(&subgraph, GQL_SCHEMA);
         // This check is awkward since the test manifest has other problems
         // that the validation complains about as setting up a valid manifest
         // would be a bit more work; we just want to make sure that
@@ -160,7 +163,8 @@ specVersion: 0.0.1
 
         let mut thing = Entity::new();
         thing.set("id", "datthing");
-        test_store::insert_entities(subgraph, vec![("Thing", thing)]).expect("Can insert a thing");
+        test_store::insert_entities(subgraph, vec![(EntityType::from("Thing"), thing)])
+            .expect("Can insert a thing");
 
         // Validation against subgraph that has not reached the graft point fails
         let unvalidated = resolve_unvalidated(YAML).await;
@@ -207,7 +211,7 @@ dataSources:
 schema:
   file:
     /: /ipfs/Qmschema
-specVersion: 0.0.1
+specVersion: 0.0.2
 ";
 
     let manifest = resolve_manifest(YAML).await;

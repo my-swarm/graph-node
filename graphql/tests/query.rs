@@ -1,38 +1,65 @@
 #[macro_use]
 extern crate pretty_assertions;
 
-use graphql_parser::{query as q, Pos};
-use std::collections::{BTreeMap, HashMap};
+use graphql_parser::Pos;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::iter::FromIterator;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use graph::data::query::CacheStatus;
-use graph::prelude::{
-    async_trait, futures03::stream::StreamExt, futures03::FutureExt, futures03::TryFutureExt, o,
-    slog, tokio, ApiSchema, DeploymentState, Entity, EntityKey, EntityOperation,
-    EthereumBlockPointer, FutureExtension, GraphQlRunner as _, Logger, Query, QueryError,
-    QueryExecutionError, QueryLoadManager, QueryResult, QueryVariables, Schema, Store,
-    SubgraphDeploymentEntity, SubgraphDeploymentId, SubgraphDeploymentStore, SubgraphManifest,
-    Subscription, SubscriptionError, Value, BLOCK_NUMBER_MAX,
+use graph::{
+    data::graphql::{object, object_value},
+    data::subgraph::schema::SubgraphError,
+    data::{
+        query::CacheStatus,
+        query::{QueryResults, QueryTarget},
+        subgraph::SubgraphFeature,
+    },
+    prelude::{
+        async_trait, futures03::stream::StreamExt, futures03::FutureExt, futures03::TryFutureExt,
+        o, q, serde_json, slog, tokio, Entity, EntityKey, EntityOperation, EthereumBlockPointer,
+        FutureExtension, GraphQlRunner as _, Logger, NodeId, Query, QueryError,
+        QueryExecutionError, QueryLoadManager, QueryResult, QueryStoreManager, QueryVariables,
+        Schema, SubgraphDeploymentEntity, SubgraphDeploymentId, SubgraphManifest, SubgraphName,
+        SubgraphStore, SubgraphVersionSwitchingMode, Subscription, SubscriptionError, Value,
+    },
 };
-use graph_graphql::prelude::*;
+use graph_graphql::{prelude::*, subscription::execute_subscription};
 use test_store::{
     execute_subgraph_query_with_complexity, execute_subgraph_query_with_deadline,
-    run_test_sequentially, transact_entity_operations, BLOCK_ONE, GENESIS_PTR, LOAD_MANAGER,
-    LOGGER, STORE,
+    run_test_sequentially, transact_entity_operations, transact_errors, BLOCK_ONE, GENESIS_PTR,
+    LOAD_MANAGER, LOGGER, STORE, SUBSCRIPTION_MANAGER,
 };
 
+const NETWORK_NAME: &str = "fake_network";
+
 fn setup() -> SubgraphDeploymentId {
+    setup_with_features("graphqlTestsQuery", BTreeSet::new())
+}
+
+fn setup_with_features(id: &str, features: BTreeSet<SubgraphFeature>) -> SubgraphDeploymentId {
     use test_store::block_store::{self, BLOCK_ONE, BLOCK_TWO, GENESIS_BLOCK};
 
-    let id = SubgraphDeploymentId::new("graphqlTestsQuery").unwrap();
+    let id = SubgraphDeploymentId::new(id).unwrap();
 
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO];
-    block_store::remove();
-    block_store::insert(chain, "fake_network");
+    block_store::set_chain(chain, NETWORK_NAME);
     test_store::remove_subgraphs();
-    insert_test_entities(STORE.as_ref(), id.clone());
+
+    let schema = test_schema(id.clone());
+    let manifest = SubgraphManifest {
+        id: id.clone(),
+        spec_version: "1".to_owned(),
+        features,
+        description: None,
+        repository: None,
+        schema: schema.clone(),
+        data_sources: vec![],
+        graft: None,
+        templates: vec![],
+    };
+
+    insert_test_entities(STORE.subgraph_store().as_ref(), manifest);
 
     id
 }
@@ -73,35 +100,20 @@ fn test_schema(id: SubgraphDeploymentId) -> Schema {
     .expect("Test schema invalid")
 }
 
-fn api_test_schema(id: &SubgraphDeploymentId) -> ApiSchema {
-    let mut schema = test_schema(id.clone());
-    schema.document = api_schema(&schema.document).expect("Failed to derive API schema");
-    schema.add_subgraph_id_directives(id.clone());
-    ApiSchema::from_api_schema(schema).unwrap()
-}
-
-fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
-    let schema = test_schema(id.clone());
-
-    // First insert the manifest.
-    let manifest = SubgraphManifest {
-        id: id.clone(),
-        location: String::new(),
-        spec_version: "1".to_owned(),
-        description: None,
-        repository: None,
-        schema: schema.clone(),
-        data_sources: vec![],
-        graft: None,
-        templates: vec![],
-    };
-
-    let ops = SubgraphDeploymentEntity::new(&manifest, false, None)
-        .create_operations_replace(&id)
-        .into_iter()
-        .map(|op| op.into())
-        .collect();
-    store.create_subgraph_deployment(&schema, ops).unwrap();
+fn insert_test_entities(store: &impl SubgraphStore, manifest: SubgraphManifest) {
+    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None);
+    let name = SubgraphName::new("test/query").unwrap();
+    let node_id = NodeId::new("test").unwrap();
+    store
+        .create_subgraph_deployment(
+            name,
+            &manifest.schema,
+            deployment,
+            node_id,
+            NETWORK_NAME.to_string(),
+            SubgraphVersionSwitchingMode::Instant,
+        )
+        .unwrap();
 
     let entities0 = vec![
         Entity::from(vec![
@@ -201,16 +213,16 @@ fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
 
     fn insert_at(entities: Vec<Entity>, id: SubgraphDeploymentId, block_ptr: EthereumBlockPointer) {
         let insert_ops = entities.into_iter().map(|data| EntityOperation::Set {
-            key: EntityKey {
-                subgraph_id: id.clone(),
-                entity_type: data["__typename"].clone().as_string().unwrap(),
-                entity_id: data["id"].clone().as_string().unwrap(),
-            },
+            key: EntityKey::data(
+                id.clone(),
+                data["__typename"].clone().as_string().unwrap(),
+                data["id"].clone().as_string().unwrap(),
+            ),
             data,
         });
 
         transact_entity_operations(
-            &STORE,
+            &STORE.subgraph_store(),
             id.clone(),
             block_ptr,
             insert_ops.collect::<Vec<_>>(),
@@ -218,8 +230,8 @@ fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
         .unwrap();
     }
 
-    insert_at(entities0, id.clone(), GENESIS_PTR.clone());
-    insert_at(entities1, id.clone(), BLOCK_ONE.clone());
+    insert_at(entities0, manifest.id.clone(), GENESIS_PTR.clone());
+    insert_at(entities1, manifest.id.clone(), BLOCK_ONE.clone());
 }
 
 async fn execute_query_document(id: &SubgraphDeploymentId, query: q::Document) -> QueryResult {
@@ -234,40 +246,30 @@ async fn execute_query_document_with_variables(
     let runner = Arc::new(GraphQlRunner::new(
         &*LOGGER,
         STORE.clone(),
+        SUBSCRIPTION_MANAGER.clone(),
         LOAD_MANAGER.clone(),
     ));
-    let query = Query::new(Arc::new(api_test_schema(id)), query, variables, None);
-    let state = DeploymentState {
-        id: query.schema.id().clone(),
-        reorg_count: 0,
-        max_reorg_depth: 0,
-        latest_ethereum_block_number: BLOCK_NUMBER_MAX,
-    };
+    let target = QueryTarget::Deployment(id.clone());
+    let query = Query::new(query, variables);
 
     runner
-        .run_query_with_complexity(query, state, None, None, None, None, false)
+        .run_query_with_complexity(query, target, None, None, None, None, false)
         .await
-        .as_ref()
-        .clone()
+        .first()
+        .unwrap()
+        .duplicate()
 }
 
-async fn execute_query_document_with_state(
-    id: &SubgraphDeploymentId,
-    query: q::Document,
-    state: DeploymentState,
-) -> QueryResult {
-    let runner = Arc::new(GraphQlRunner::new(
-        &*LOGGER,
-        STORE.clone(),
-        LOAD_MANAGER.clone(),
-    ));
-    let query = Query::new(Arc::new(api_test_schema(id)), query, None, None);
-
-    graph::prelude::futures03::executor::block_on(
-        runner.run_query_with_complexity(query, state, None, None, None, None, false),
-    )
-    .as_ref()
-    .clone()
+async fn first_result<F>(f: F) -> QueryResult
+where
+    F: FnOnce() -> QueryResults + Sync + Send + 'static,
+{
+    graph::spawn_blocking_allow_panic(f)
+        .await
+        .unwrap()
+        .first()
+        .unwrap()
+        .duplicate()
 }
 
 struct MockQueryLoadManager(Arc<tokio::sync::Semaphore>);
@@ -275,7 +277,8 @@ struct MockQueryLoadManager(Arc<tokio::sync::Semaphore>);
 #[async_trait]
 impl QueryLoadManager for MockQueryLoadManager {
     async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.0.clone().acquire_owned().await
+        // Unwrap: The semaphore is never closed.
+        self.0.clone().acquire_owned().await.unwrap()
     }
 
     fn record_work(&self, _shape_hash: u64, _duration: Duration, _cache_status: CacheStatus) {}
@@ -291,7 +294,7 @@ fn mock_query_load_manager() -> Arc<MockQueryLoadManager> {
 macro_rules! extract_data {
     ($result: expr) => {
         match $result.to_result() {
-            Err(errors) => panic!(format!("Unexpected errors return for query: {:#?}", errors)),
+            Err(errors) => panic!("Unexpected errors return for query: {:#?}", errors),
             Ok(data) => data,
         }
     };
@@ -322,7 +325,8 @@ fn can_query_one_to_one_relationship() {
             }
             ",
             )
-            .expect("Invalid test query"),
+            .expect("Invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -418,7 +422,8 @@ fn can_query_one_to_many_relationships_in_both_directions() {
         }
         ",
             )
-            .expect("Invalid test query"),
+            .expect("Invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -517,7 +522,8 @@ fn can_query_many_to_many_relationship() {
             }
             ",
             )
-            .expect("Invalid test query"),
+            .expect("Invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -589,7 +595,8 @@ fn query_variables_are_used() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         let result = execute_query_document_with_variables(
             &id,
@@ -630,7 +637,8 @@ fn skip_directive_works_with_query_variables() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         // Set variable $skip to true
         let result = execute_query_document_with_variables(
@@ -707,7 +715,8 @@ fn include_directive_works_with_query_variables() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         // Set variable $include to true
         let result = execute_query_document_with_variables(
@@ -775,7 +784,6 @@ fn include_directive_works_with_query_variables() {
 fn query_complexity() {
     run_test_sequentially(setup, |_, id| async move {
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
             graphql_parser::parse_query(
                 "query {
                 musicians(orderBy: id) {
@@ -789,22 +797,21 @@ fn query_complexity() {
                 }
             }",
             )
-            .unwrap(),
-            None,
+            .unwrap()
+            .into_static(),
             None,
         );
         let max_complexity = Some(1_010_100);
 
         // This query is exactly at the maximum complexity.
-        let result = graph::spawn_blocking_allow_panic(move || {
-            execute_subgraph_query_with_complexity(query, max_complexity)
+        let id2 = id.clone();
+        let result = first_result(move || {
+            execute_subgraph_query_with_complexity(query, id2.into(), max_complexity)
         })
-        .await
-        .unwrap();
+        .await;
         assert!(!result.has_errors());
 
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
             graphql_parser::parse_query(
                 "query {
                 musicians(orderBy: id) {
@@ -823,17 +830,16 @@ fn query_complexity() {
                 }
             }",
             )
-            .unwrap(),
-            None,
+            .unwrap()
+            .into_static(),
             None,
         );
 
         // The extra introspection causes the complexity to go over.
-        let result = graph::spawn_blocking_allow_panic(move || {
-            execute_subgraph_query_with_complexity(query, max_complexity)
+        let result = first_result(move || {
+            execute_subgraph_query_with_complexity(query, id.into(), max_complexity)
         })
-        .await
-        .unwrap();
+        .await;
         match result.to_result().unwrap_err()[0] {
             QueryError::ExecutionError(QueryExecutionError::TooComplex(1_010_200, _)) => (),
             _ => panic!("did not catch complexity"),
@@ -845,10 +851,13 @@ fn query_complexity() {
 fn query_complexity_subscriptions() {
     run_test_sequentially(setup, |_, id| async move {
         let logger = Logger::root(slog::Discard, o!());
-        let store_resolver = StoreResolver::for_subscription(&logger, id.clone(), STORE.clone());
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
 
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
             graphql_parser::parse_query(
                 "subscription {
                 musicians(orderBy: id) {
@@ -862,14 +871,15 @@ fn query_complexity_subscriptions() {
                 }
             }",
             )
-            .unwrap(),
-            None,
+            .unwrap()
+            .into_static(),
             None,
         );
         let max_complexity = Some(1_010_100);
         let options = SubscriptionExecutionOptions {
             logger: logger.clone(),
-            resolver: store_resolver,
+            store: store.clone(),
+            subscription_manager: SUBSCRIPTION_MANAGER.clone(),
             timeout: None,
             max_complexity,
             max_depth: 100,
@@ -877,13 +887,14 @@ fn query_complexity_subscriptions() {
             max_skip: std::u32::MAX,
             load_manager: mock_query_load_manager(),
         };
+        let schema = STORE.subgraph_store().api_schema(&id).unwrap();
 
         // This query is exactly at the maximum complexity.
         // FIXME: Not collecting the stream because that will hang the test.
-        let _ignore_stream = execute_subscription(Subscription { query }, options).unwrap();
+        let _ignore_stream =
+            execute_subscription(Subscription { query }, schema.clone(), options).unwrap();
 
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
             graphql_parser::parse_query(
                 "subscription {
                 musicians(orderBy: id) {
@@ -902,16 +913,21 @@ fn query_complexity_subscriptions() {
                 }
             }",
             )
-            .unwrap(),
-            None,
+            .unwrap()
+            .into_static(),
             None,
         );
 
-        let store_resolver = StoreResolver::for_subscription(&logger, id.clone(), STORE.clone());
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
 
         let options = SubscriptionExecutionOptions {
             logger,
-            resolver: store_resolver,
+            store,
+            subscription_manager: SUBSCRIPTION_MANAGER.clone(),
             timeout: None,
             max_complexity,
             max_depth: 100,
@@ -921,7 +937,7 @@ fn query_complexity_subscriptions() {
         };
 
         // The extra introspection causes the complexity to go over.
-        let result = execute_subscription(Subscription { query }, options);
+        let result = execute_subscription(Subscription { query }, schema, options);
         match result {
             Err(SubscriptionError::GraphQLError(e)) => match e[0] {
                 QueryExecutionError::TooComplex(1_010_200, _) => (), // Expected
@@ -936,17 +952,16 @@ fn query_complexity_subscriptions() {
 fn instant_timeout() {
     run_test_sequentially(setup, |_, id| async move {
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
-            graphql_parser::parse_query("query { musicians(first: 100) { name } }").unwrap(),
-            None,
+            graphql_parser::parse_query("query { musicians(first: 100) { name } }")
+                .unwrap()
+                .into_static(),
             None,
         );
 
-        match graph::spawn_blocking_allow_panic(move || {
-            execute_subgraph_query_with_deadline(query, Some(Instant::now()))
+        match first_result(move || {
+            execute_subgraph_query_with_deadline(query, id.into(), Some(Instant::now()))
         })
         .await
-        .unwrap()
         .to_result()
         .unwrap_err()[0]
         {
@@ -968,7 +983,8 @@ fn variable_defaults() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         // Assert that missing variables are defaulted.
         let result = execute_query_document_with_variables(
@@ -1024,7 +1040,8 @@ fn skip_is_nullable() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         let result = execute_query_document_with_variables(&id, query, None).await;
 
@@ -1055,7 +1072,8 @@ fn first_is_nullable() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         let result = execute_query_document_with_variables(&id, query, None).await;
 
@@ -1086,7 +1104,8 @@ fn nested_variable() {
         }
     ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         let result = execute_query_document_with_variables(
             &id,
@@ -1125,7 +1144,8 @@ fn ambiguous_derived_from_result() {
         }
         ",
         )
-        .expect("invalid test query");
+        .expect("invalid test query")
+        .into_static();
 
         let result = execute_query_document_with_variables(&id, query, None).await;
 
@@ -1147,10 +1167,7 @@ fn ambiguous_derived_from_result() {
                 assert_eq!(target_type.as_str(), "Band");
                 assert_eq!(target_field.as_str(), "originalSongs");
             }
-            e => panic!(format!(
-                "expected AmbiguousDerivedFromResult error, got {}",
-                e
-            )),
+            e => panic!("expected AmbiguousDerivedFromResult error, got {}", e),
         }
     })
 }
@@ -1174,7 +1191,8 @@ fn can_filter_by_relationship_fields() {
         }
         ",
             )
-            .expect("invalid test query"),
+            .expect("invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -1227,7 +1245,8 @@ fn cannot_filter_by_derved_relationship_fields() {
         }
         ",
             )
-            .expect("invalid test query"),
+            .expect("invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -1242,7 +1261,7 @@ fn cannot_filter_by_derved_relationship_fields() {
                     )]),
                 );
             }
-            e => panic!(format!("expected ResolveEntitiesError, got {}", e)),
+            e => panic!("expected ResolveEntitiesError, got {}", e),
         };
     })
 }
@@ -1251,10 +1270,14 @@ fn cannot_filter_by_derved_relationship_fields() {
 fn subscription_gets_result_even_without_events() {
     run_test_sequentially(setup, |_, id| async move {
         let logger = Logger::root(slog::Discard, o!());
-        let store_resolver = StoreResolver::for_subscription(&logger, id.clone(), STORE.clone());
+        let store = STORE
+            .clone()
+            .query_store(id.clone().into(), true)
+            .await
+            .unwrap();
+        let schema = STORE.subgraph_store().api_schema(&id).unwrap();
 
         let query = Query::new(
-            Arc::new(api_test_schema(&id)),
             graphql_parser::parse_query(
                 "subscription {
               musicians(orderBy: id, first: 2) {
@@ -1262,14 +1285,15 @@ fn subscription_gets_result_even_without_events() {
               }
             }",
             )
-            .unwrap(),
-            None,
+            .unwrap()
+            .into_static(),
             None,
         );
 
         let options = SubscriptionExecutionOptions {
             logger: logger.clone(),
-            resolver: store_resolver,
+            store,
+            subscription_manager: SUBSCRIPTION_MANAGER.clone(),
             timeout: None,
             max_complexity: None,
             max_depth: 100,
@@ -1277,10 +1301,9 @@ fn subscription_gets_result_even_without_events() {
             max_skip: std::u32::MAX,
             load_manager: mock_query_load_manager(),
         };
-
         // Execute the subscription and expect at least one result to be
         // available in the result stream
-        let stream = execute_subscription(Subscription { query }, options).unwrap();
+        let stream = execute_subscription(Subscription { query }, schema, options).unwrap();
         let results: Vec<_> = stream
             .take(1)
             .collect()
@@ -1292,9 +1315,9 @@ fn subscription_gets_result_even_without_events() {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let result = &results[0];
+        let result = Arc::try_unwrap(results.into_iter().next().unwrap()).unwrap();
         assert_eq!(
-            extract_data!(result.as_ref().clone()),
+            extract_data!(result),
             Some(object_value(vec![(
                 "musicians",
                 q::Value::List(vec![
@@ -1321,7 +1344,8 @@ fn can_use_nested_filter() {
         }
         ",
             )
-            .expect("invalid test query"),
+            .expect("invalid test query")
+            .into_static(),
         )
         .await;
 
@@ -1370,7 +1394,9 @@ async fn check_musicians_at(
     expected: Result<Vec<&str>, &str>,
     qid: &str,
 ) {
-    let query = graphql_parser::parse_query(query).expect("invalid test query");
+    let query = graphql_parser::parse_query(query)
+        .expect("invalid test query")
+        .into_static();
     let vars = block_var.map(|(name, value)| {
         let mut map = HashMap::new();
         map.insert(name.to_owned(), value);
@@ -1379,8 +1405,8 @@ async fn check_musicians_at(
 
     let result = execute_query_document_with_variables(id, query, vars).await;
 
-    match (STORE.uses_relational_schema(id).unwrap(), expected) {
-        (true, Ok(ids)) => {
+    match expected {
+        Ok(ids) => {
             let ids: Vec<_> = ids
                 .into_iter()
                 .map(|id| object_value(vec![("id", q::Value::String(String::from(id)))]))
@@ -1392,7 +1418,7 @@ async fn check_musicians_at(
             };
             assert_eq!(data, expected, "failed query: ({})", qid);
         }
-        (true, Err(msg)) => {
+        Err(msg) => {
             let errors = match result.to_result() {
                 Err(errors) => errors,
                 Ok(_) => panic!(
@@ -1410,13 +1436,6 @@ async fn check_musicians_at(
                 "expected error message `{}` but got {:?} ({})",
                 msg,
                 errors,
-                qid
-            );
-        }
-        (false, _) => {
-            assert!(
-                result.has_errors(),
-                "JSONB does not support time travel: {}",
                 qid
             );
         }
@@ -1527,46 +1546,26 @@ fn query_at_block_with_vars() {
     })
 }
 
-/// Check that the `extensions` field in the query result has the correct format
-#[test]
-#[ignore]
-fn block_extension() {
-    run_test_sequentially(setup, |_, id| async move {
-        let query = format!("query {{ musicians(block: {{ number: 0 }}) {{ id }} }}");
-        let query = graphql_parser::parse_query(&query).expect("invalid test query");
-
-        let result = execute_query_document(&id, query).await;
-
-        if STORE.uses_relational_schema(&id).unwrap() {
-            let ext = object! {
-            subgraph: object! {
-                blocks: object! {
-                    unknown: object! {
-                        hash: "0000000000000000000000000000000000000000000000000000000000000000",
-                        number: 0}},
-                id: "graphqlTestsQuery" }};
-            assert_eq!(Some(ext), result.extensions);
-        } else {
-            assert_eq!(None, result.extensions);
-        }
-    })
-}
-
 #[test]
 fn query_detects_reorg() {
     run_test_sequentially(setup, |_, id| async move {
-        if !STORE.uses_relational_schema(&id).unwrap() {
-            // We don't care about JSONB storage
-            return;
-        }
         let query = "query { musician(id: \"m1\") { id } }";
-        let query = graphql_parser::parse_query(query).expect("invalid test query");
+        let query = graphql_parser::parse_query(query)
+            .expect("invalid test query")
+            .into_static();
         let state = STORE
+            .subgraph_store()
             .deployment_state_from_id(id.clone())
+            .await
             .expect("failed to get state");
 
+        // Inject a fake initial state; c435c25decbc4ad7bbbadf8e0ced0ff2
+        *graph_graphql::test_support::INITIAL_DEPLOYMENT_STATE_FOR_TESTS
+            .lock()
+            .unwrap() = Some(state);
+
         // When there is no revert, queries work fine
-        let result = execute_query_document_with_state(&id, query.clone(), state.clone()).await;
+        let result = execute_query_document(&id, query.clone()).await;
 
         assert_eq!(
             extract_data!(result),
@@ -1575,13 +1574,14 @@ fn query_detects_reorg() {
 
         // Revert one block
         STORE
-            .revert_block_operations(id.clone(), BLOCK_ONE.clone(), GENESIS_PTR.clone())
+            .subgraph_store()
+            .revert_block_operations(id.clone(), GENESIS_PTR.clone())
             .unwrap();
         // A query is still fine since we implicitly query at block 0; we were
         // at block 1 when we got `state`, and reorged once by one block, which
         // can not affect block 0, and it's therefore ok to query at block 0
         // even with a concurrent reorg
-        let result = execute_query_document_with_state(&id, query.clone(), state.clone()).await;
+        let result = execute_query_document(&id, query.clone()).await;
         assert_eq!(
             extract_data!(result),
             Some(object!(musician: object!(id: "m1")))
@@ -1590,42 +1590,55 @@ fn query_detects_reorg() {
         // We move the subgraph head forward, which will execute the query at block 1
         // But the state we have is also for block 1, but with a smaller reorg count
         // and we therefore report an error
-        transact_entity_operations(&*STORE, id.clone(), BLOCK_ONE.clone(), vec![]).unwrap();
-        let result = execute_query_document_with_state(&id, query.clone(), state).await;
+        transact_entity_operations(
+            &STORE.subgraph_store(),
+            id.clone(),
+            BLOCK_ONE.clone(),
+            vec![],
+        )
+        .unwrap();
+        let result = execute_query_document(&id, query.clone()).await;
         match result.to_result().unwrap_err()[0] {
             QueryError::ExecutionError(QueryExecutionError::DeploymentReverted) => { /* expected */
             }
             _ => panic!("unexpected error from block reorg"),
         }
+
+        // Reset the fake initial state; c435c25decbc4ad7bbbadf8e0ced0ff2
+        *graph_graphql::test_support::INITIAL_DEPLOYMENT_STATE_FOR_TESTS
+            .lock()
+            .unwrap() = None;
     })
 }
 
 #[test]
 fn can_query_meta() {
     run_test_sequentially(setup, |_, id| async move {
-        if !STORE.uses_relational_schema(&id).unwrap() {
-            // We don't care about JSONB storage
-            return;
-        }
         // metadata for the latest block (block 1)
-        let query = "query { _meta { deployment block { hash number } } }";
-        let query = graphql_parser::parse_query(query).expect("invalid test query");
+        let query = "query { _meta { deployment block { hash number __typename } __typename } }";
+        let query = graphql_parser::parse_query(query)
+            .expect("invalid test query")
+            .into_static();
 
         let result = execute_query_document(&id, query).await;
         let exp = object! {
             _meta: object! {
                 block: object! {
                     hash: "0x8511fa04b64657581e3f00e14543c1d522d5d7e771b54aa3060b662ade47da13",
-                    number: 1
+                    number: 1,
+                    __typename: "_Block_"
                 },
-                deployment: "graphqlTestsQuery"
+                deployment: "graphqlTestsQuery",
+                __typename: "_Meta_"
             },
         };
         assert_eq!(extract_data!(result), Some(exp));
 
         // metadata for block 0 by number
         let query = "query { _meta(block: { number: 0 }) { deployment block { hash number } } }";
-        let query = graphql_parser::parse_query(query).expect("invalid test query");
+        let query = graphql_parser::parse_query(query)
+            .expect("invalid test query")
+            .into_static();
 
         let result = execute_query_document(&id, query).await;
         let exp = object! {
@@ -1642,7 +1655,9 @@ fn can_query_meta() {
         // metadata for block 0 by hash
         let query = "query { _meta(block: { hash: \"bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f\" }) { \
                                         deployment block { hash number } } }";
-        let query = graphql_parser::parse_query(query).expect("invalid test query");
+        let query = graphql_parser::parse_query(query)
+            .expect("invalid test query")
+            .into_static();
 
         let result = execute_query_document(&id, query).await;
         let exp = object! {
@@ -1658,9 +1673,112 @@ fn can_query_meta() {
 
         // metadata for block 2, which is beyond what the subgraph has indexed
         let query = "query { _meta(block: { number: 2 }) { deployment block { hash number } } }";
-        let query = graphql_parser::parse_query(query).expect("invalid test query");
+        let query = graphql_parser::parse_query(query)
+            .expect("invalid test query")
+            .into_static();
 
         let result = execute_query_document(&id, query).await;
         assert!(result.has_errors());
     })
+}
+
+#[test]
+fn non_fatal_errors() {
+    use serde_json::json;
+    use test_store::block_store::BLOCK_TWO;
+
+    run_test_sequentially(
+        || {
+            setup_with_features(
+                "testNonFatalErrors",
+                BTreeSet::from_iter(Some(SubgraphFeature::nonFatalErrors)),
+            )
+        },
+        |_, id| async move {
+            let err = SubgraphError {
+                subgraph_id: id.clone(),
+                message: "cow template handler could not moo event transaction".to_string(),
+                block_ptr: Some(BLOCK_TWO.block_ptr()),
+                handler: Some("handleMoo".to_string()),
+                deterministic: true,
+            };
+
+            transact_errors(&*STORE, id.clone(), BLOCK_TWO.block_ptr(), vec![err]).unwrap();
+
+            // `subgraphError` is implicitly `deny`, data is omitted.
+            let query = "query { musician(id: \"m1\") { id } }";
+            let query = graphql_parser::parse_query(query).unwrap().into_static();
+            let result = execute_query_document(&id, query).await;
+            let expected = json!({
+                "errors": [
+                    {
+                        "message": "indexing_error"
+                    }
+                ]
+            });
+            assert_eq!(expected, serde_json::to_value(&result).unwrap());
+
+            // Same result for explicit `deny`.
+            let query = "query { musician(id: \"m1\", subgraphError: deny) { id } }";
+            let query = graphql_parser::parse_query(query).unwrap().into_static();
+            let result = execute_query_document(&id, query).await;
+            assert_eq!(expected, serde_json::to_value(&result).unwrap());
+
+            // But `_meta` is still returned.
+            let query = "query { musician(id: \"m1\") { id }  _meta { hasIndexingErrors } }";
+            let query = graphql_parser::parse_query(query).unwrap().into_static();
+            let result = execute_query_document(&id, query).await;
+            let expected = json!({
+                "data": {
+                    "_meta": {
+                        "hasIndexingErrors": true
+                    }
+                },
+                "errors": [
+                    {
+                        "message": "indexing_error"
+                    }
+                ]
+            });
+            assert_eq!(expected, serde_json::to_value(&result).unwrap());
+
+            // With `allow`, the error remains but the data is included.
+            let query = "query { musician(id: \"m1\", subgraphError: allow) { id } }";
+            let query = graphql_parser::parse_query(query).unwrap().into_static();
+            let result = execute_query_document(&id, query).await;
+            let expected = json!({
+                "data": {
+                    "musician": {
+                        "id": "m1"
+                    }
+                },
+                "errors": [
+                    {
+                        "message": "indexing_error"
+                    }
+                ]
+            });
+            assert_eq!(expected, serde_json::to_value(&result).unwrap());
+
+            // Test error reverts.
+            STORE
+                .subgraph_store()
+                .revert_block_operations(id.clone(), BLOCK_ONE.clone())
+                .unwrap();
+            let query = "query { musician(id: \"m1\") { id }  _meta { hasIndexingErrors } }";
+            let query = graphql_parser::parse_query(query).unwrap().into_static();
+            let result = execute_query_document(&id, query).await;
+            let expected = json!({
+                "data": {
+                    "musician": {
+                        "id": "m1"
+                    },
+                    "_meta": {
+                        "hasIndexingErrors": false
+                    }
+                }
+            });
+            assert_eq!(expected, serde_json::to_value(&result).unwrap());
+        },
+    )
 }

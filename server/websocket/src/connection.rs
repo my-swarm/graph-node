@@ -7,12 +7,12 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
-use tokio::prelude::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-use graph::prelude::*;
+use graph::{data::query::QueryTarget, prelude::*};
 
 lazy_static! {
     static ref MAX_OPERATIONS_PER_CONNECTION: Option<usize> =
@@ -45,9 +45,9 @@ impl IncomingMessage {
     pub fn from_ws_message(msg: WsMessage) -> Result<Self, WsError> {
         let text = msg.into_text()?;
         serde_json::from_str(text.as_str()).map_err(|e| {
-            WsError::Protocol(
+            WsError::Http(http::Response::new(Some(
                 format!("Invalid GraphQL over WebSocket message: {}: {}", text, e).into(),
-            )
+            )))
         })
     }
 }
@@ -94,8 +94,11 @@ fn send_message(
     sink: &mpsc::UnboundedSender<WsMessage>,
     msg: OutgoingMessage,
 ) -> Result<(), WsError> {
-    sink.unbounded_send(msg.into())
-        .map_err(|_| WsError::Http(StatusCode::INTERNAL_SERVER_ERROR))
+    sink.unbounded_send(msg.into()).map_err(|_| {
+        let mut response = http::Response::new(None);
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        WsError::Http(response)
+    })
 }
 
 /// Helper function to send error messages.
@@ -105,7 +108,11 @@ fn send_error_string(
     error: String,
 ) -> Result<(), WsError> {
     sink.unbounded_send(OutgoingMessage::from_error_string(operation_id, error).into())
-        .map_err(|_| WsError::Http(StatusCode::INTERNAL_SERVER_ERROR))
+        .map_err(|_| {
+            let mut response = http::Response::new(None);
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            WsError::Http(response)
+        })
 }
 
 /// Responsible for recording operation ids and stopping them.
@@ -263,7 +270,7 @@ where
                     // Parse the GraphQL query document; respond with a GQL_ERROR if
                     // the query is invalid
                     let query = match parse_query(&payload.query) {
-                        Ok(query) => query,
+                        Ok(query) => query.into_static(),
                         Err(e) => {
                             return send_error_string(
                                 &msg_sink,
@@ -298,10 +305,11 @@ where
                     };
 
                     // Construct a subscription
+                    let target = QueryTarget::Deployment(schema.schema.id.clone());
                     let subscription = Subscription {
                         // Subscriptions currently do not benefit from the generational cache
                         // anyways, so don't bother passing a network.
-                        query: Query::new(schema.clone(), query, variables, None),
+                        query: Query::new(query, variables),
                     };
 
                     debug!(logger, "Start operation";
@@ -317,7 +325,7 @@ where
                     let err_logger = logger.clone();
                     let run_subscription = graphql_runner
                         .cheap_clone()
-                        .run_subscription(subscription)
+                        .run_subscription(subscription, target)
                         .compat()
                         .map_err(move |e| {
                             debug!(err_logger, "Subscription error";
@@ -339,7 +347,10 @@ where
                                             err_id.clone(),
                                             result,
                                         );
-                                        error_sink.unbounded_send(msg.into()).unwrap();
+
+                                        // An error means the client closed the websocket, ignore
+                                        // and let it be handled in the websocket loop above.
+                                        let _ = error_sink.unbounded_send(msg.into());
                                     }
                                 }
                             };

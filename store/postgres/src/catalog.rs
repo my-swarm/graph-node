@@ -1,25 +1,24 @@
-use diesel::pg::PgConnection;
 use diesel::prelude::RunQueryDsl;
 use diesel::sql_types::Text;
+use diesel::{pg::PgConnection, sql_query};
 use std::collections::{HashMap, HashSet};
 
-use graph::prelude::StoreError;
+use graph::{data::subgraph::schema::POI_TABLE, prelude::StoreError};
 
-use crate::relational::SqlName;
+use crate::{primary::Namespace, relational::SqlName};
 
 /// Information about what tables and columns we have in the database
 #[derive(Debug, Clone)]
 pub struct Catalog {
-    pub schema: String,
+    pub namespace: Namespace,
     text_columns: HashMap<String, HashSet<String>>,
 }
 
 impl Catalog {
-    pub fn new(conn: &PgConnection, schema: String) -> Result<Self, StoreError> {
-        SqlName::check_valid_identifier(&schema, "database schema")?;
-        let text_columns = get_text_columns(conn, &schema)?;
+    pub fn new(conn: &PgConnection, namespace: Namespace) -> Result<Self, StoreError> {
+        let text_columns = get_text_columns(conn, &namespace)?;
         Ok(Catalog {
-            schema,
+            namespace,
             text_columns,
         })
     }
@@ -27,10 +26,9 @@ impl Catalog {
     /// Make a catalog as if the given `schema` did not exist in the database
     /// yet. This function should only be used in situations where a database
     /// connection is definitely not available, such as in unit tests
-    pub fn make_empty(schema: String) -> Result<Self, StoreError> {
-        SqlName::check_valid_identifier(&schema, "database schema")?;
+    pub fn make_empty(namespace: Namespace) -> Result<Self, StoreError> {
         Ok(Catalog {
-            schema,
+            namespace,
             text_columns: HashMap::default(),
         })
     }
@@ -47,7 +45,7 @@ impl Catalog {
 
 fn get_text_columns(
     conn: &PgConnection,
-    schema: &str,
+    namespace: &Namespace,
 ) -> Result<HashMap<String, HashSet<String>>, StoreError> {
     const QUERY: &str = "
         select table_name, column_name
@@ -63,7 +61,7 @@ fn get_text_columns(
     }
 
     let map: HashMap<String, HashSet<String>> = diesel::sql_query(QUERY)
-        .bind::<Text, _>(schema)
+        .bind::<Text, _>(namespace.as_str())
         .load::<Column>(conn)?
         .into_iter()
         .fold(HashMap::new(), |mut map, col| {
@@ -73,4 +71,35 @@ fn get_text_columns(
             map
         });
     Ok(map)
+}
+
+pub fn supports_proof_of_indexing(
+    conn: &diesel::pg::PgConnection,
+    namespace: &Namespace,
+) -> Result<bool, StoreError> {
+    #[derive(Debug, QueryableByName)]
+    struct Table {
+        #[sql_type = "Text"]
+        pub table_name: String,
+    }
+    let query =
+        "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2";
+    let result: Vec<Table> = diesel::sql_query(query)
+        .bind::<Text, _>(namespace.as_str())
+        .bind::<Text, _>(POI_TABLE)
+        .load(conn)?;
+    Ok(result.len() > 0)
+}
+
+pub fn current_servers(conn: &PgConnection) -> Result<Vec<String>, StoreError> {
+    #[derive(QueryableByName)]
+    struct Srv {
+        #[sql_type = "Text"]
+        srvname: String,
+    }
+    Ok(sql_query("select srvname from pg_foreign_server")
+        .get_results::<Srv>(conn)?
+        .into_iter()
+        .map(|srv| srv.srvname)
+        .collect())
 }

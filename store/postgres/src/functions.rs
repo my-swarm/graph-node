@@ -1,4 +1,4 @@
-use diesel::sql_types::{BigInt, Bool, Text};
+use diesel::sql_types::{Bool, Integer, Range, Text};
 
 // Create modules for hosting stored procedures
 sql_function! { fn current_setting(setting_name: Text, missing_ok: Bool) }
@@ -8,13 +8,9 @@ sql_function! {
 }
 
 sql_function! {
-    fn attempt_chain_head_update(net_name: Text, ancestor_count: BigInt) -> Array<Text>
-}
-
-sql_function! {
-    fn lookup_ancestor_block(start_block_hash: Text, ancestor_count: BigInt) -> Nullable<Jsonb>
-}
-
-sql_function! {
     fn pg_notify(channel: Text, msg: Text)
+}
+
+sql_function! {
+    fn lower(range: Range<Integer>) -> Integer
 }

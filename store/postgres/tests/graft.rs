@@ -1,16 +1,14 @@
-use diesel::pg::PgConnection;
-use diesel::*;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::str::FromStr;
 use test_store::*;
 
-use graph::components::store::{EntityKey, EntityOrder, EntityQuery};
+use graph::components::store::{EntityKey, EntityOrder, EntityQuery, EntityType};
 use graph::data::store::scalar;
 use graph::data::subgraph::schema::*;
 use graph::data::subgraph::*;
 use graph::prelude::*;
-use graph_store_postgres::Store as DieselStore;
+use graph_store_postgres::SubgraphStore as DieselSubgraphStore;
 use web3::types::H256;
 
 const USER_GQL: &str = "
@@ -86,15 +84,15 @@ lazy_static! {
 /// Test harness for running database integration tests.
 fn run_test<R, F>(test: F)
 where
-    F: FnOnce(Arc<DieselStore>) -> R + Send + 'static,
+    F: FnOnce(Arc<DieselSubgraphStore>) -> R + Send + 'static,
     R: IntoFuture<Item = ()> + Send + 'static,
     R::Error: Send + Debug,
     R::Future: Send,
 {
-    let store = STORE.clone();
+    let store = STORE.subgraph_store();
 
     // Lock regardless of poisoning. This also forces sequential test execution.
-    let mut runtime = match STORE_RUNTIME.lock() {
+    let runtime = match STORE_RUNTIME.lock() {
         Ok(guard) => guard,
         Err(err) => err.into_inner(),
     };
@@ -117,11 +115,11 @@ where
 ///
 /// Inserts data in test blocks 1, 2, and 3, leaving test blocks 3A, 4, and 4A for the tests to
 /// use.
-fn insert_test_data(store: Arc<DieselStore>) {
+fn insert_test_data(store: Arc<DieselSubgraphStore>) {
     let manifest = SubgraphManifest {
         id: TEST_SUBGRAPH_ID.clone(),
-        location: "/ipfs/test".to_owned(),
         spec_version: "1".to_owned(),
+        features: Default::default(),
         description: None,
         repository: None,
         schema: TEST_SUBGRAPH_SCHEMA.clone(),
@@ -131,10 +129,18 @@ fn insert_test_data(store: Arc<DieselStore>) {
     };
 
     // Create SubgraphDeploymentEntity
-    let ops =
-        SubgraphDeploymentEntity::new(&manifest, false, None).create_operations(&*TEST_SUBGRAPH_ID);
+    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None);
+    let name = SubgraphName::new("test/graft").unwrap();
+    let node_id = NodeId::new("test").unwrap();
     store
-        .create_subgraph_deployment(&TEST_SUBGRAPH_SCHEMA, ops)
+        .create_subgraph_deployment(
+            name,
+            &TEST_SUBGRAPH_SCHEMA,
+            deployment,
+            node_id,
+            "fake_network".to_string(),
+            SubgraphVersionSwitchingMode::Instant,
+        )
         .unwrap();
 
     let test_entity_1 = create_test_entity(
@@ -150,7 +156,7 @@ fn insert_test_data(store: Arc<DieselStore>) {
     transact_entity_operations(
         &store,
         TEST_SUBGRAPH_ID.clone(),
-        BLOCKS[0],
+        BLOCKS[0].clone(),
         vec![test_entity_1],
     )
     .unwrap();
@@ -178,7 +184,7 @@ fn insert_test_data(store: Arc<DieselStore>) {
     transact_entity_operations(
         &store,
         TEST_SUBGRAPH_ID.clone(),
-        BLOCKS[1],
+        BLOCKS[1].clone(),
         vec![test_entity_2, test_entity_3_1],
     )
     .unwrap();
@@ -196,7 +202,7 @@ fn insert_test_data(store: Arc<DieselStore>) {
     transact_entity_operations(
         &store,
         TEST_SUBGRAPH_ID.clone(),
-        BLOCKS[2],
+        BLOCKS[2].clone(),
         vec![test_entity_3_2],
     )
     .unwrap();
@@ -235,47 +241,40 @@ fn create_test_entity(
     );
 
     EntityOperation::Set {
-        key: EntityKey {
-            subgraph_id: TEST_SUBGRAPH_ID.clone(),
-            entity_type: entity_type.to_owned(),
-            entity_id: id.to_owned(),
-        },
+        key: EntityKey::data(
+            TEST_SUBGRAPH_ID.clone(),
+            entity_type.to_owned(),
+            id.to_owned(),
+        ),
         data: test_entity,
     }
 }
 
 /// Removes test data from the database behind the store.
-fn remove_test_data(store: Arc<graph_store_postgres::Store>) {
-    let url = postgres_test_url();
-    let conn = PgConnection::establish(url.as_str()).expect("Failed to connect to Postgres");
-    graph_store_postgres::store::delete_all_entities_for_test_use_only(&store, &conn)
-        .expect("Failed to remove entity test data");
+fn remove_test_data(store: Arc<DieselSubgraphStore>) {
+    store
+        .delete_all_entities_for_test_use_only()
+        .expect("deleting test entities succeeds");
 }
 
 #[test]
 fn graft() {
     run_test(move |store| -> Result<(), ()> {
         const SUBGRAPH: &str = "grafted";
+
         let subgraph_id = SubgraphDeploymentId::new(SUBGRAPH).unwrap();
         let res = test_store::create_grafted_subgraph(
-            SUBGRAPH,
+            &subgraph_id,
             GRAFT_GQL,
             TEST_SUBGRAPH_ID.as_str(),
-            BLOCKS[1],
+            BLOCKS[1].clone(),
         );
-
-        if *USING_RELATIONAL_STORAGE {
-            assert!(res.is_ok())
-        } else {
-            // Grafting for JSONB storage just fails
-            assert!(res.is_err());
-            return Ok(());
-        }
+        assert!(res.is_ok());
 
         let query = EntityQuery::new(
             subgraph_id.clone(),
             BLOCK_NUMBER_MAX,
-            EntityCollection::All(vec![USER.to_owned()]),
+            EntityCollection::All(vec![EntityType::from(USER)]),
         )
         .order(EntityOrder::Descending(
             "name".to_string(),
@@ -301,21 +300,18 @@ fn graft() {
         // Make our own entries for block 2
         shaq.set("email", "shaq@gmail.com");
         let op = EntityOperation::Set {
-            key: EntityKey {
-                subgraph_id: subgraph_id.clone(),
-                entity_type: USER.to_owned(),
-                entity_id: "3".to_owned(),
-            },
+            key: EntityKey::data(subgraph_id.clone(), USER.to_owned(), "3".to_owned()),
             data: shaq,
         };
-        transact_entity_operations(&store, subgraph_id.clone(), BLOCKS[2], vec![op]).unwrap();
+        transact_entity_operations(&store, subgraph_id.clone(), BLOCKS[2].clone(), vec![op])
+            .unwrap();
 
         store
-            .revert_block_operations(subgraph_id.clone(), BLOCKS[2], BLOCKS[1])
+            .revert_block_operations(subgraph_id.clone(), BLOCKS[1].clone())
             .expect("We can revert a block we just created");
 
         let err = store
-            .revert_block_operations(subgraph_id.clone(), BLOCKS[1], BLOCKS[0])
+            .revert_block_operations(subgraph_id.clone(), BLOCKS[0].clone())
             .expect_err("Reverting past graft point is not allowed");
 
         assert!(err.to_string().contains("Can not revert subgraph"));

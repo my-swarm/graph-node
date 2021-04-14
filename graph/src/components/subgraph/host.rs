@@ -1,15 +1,15 @@
 use std::cmp::PartialEq;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
+use anyhow::Error;
 use async_trait::async_trait;
-use failure::Error;
 use futures::sync::mpsc;
 
 use crate::components::metrics::HistogramVec;
 use crate::components::subgraph::SharedProofOfIndexing;
 use crate::prelude::*;
-use web3::types::{Log, Transaction};
 
 #[derive(Debug)]
 pub enum MappingError {
@@ -21,15 +21,6 @@ pub enum MappingError {
 impl From<anyhow::Error> for MappingError {
     fn from(e: anyhow::Error) -> Self {
         MappingError::Unknown(e)
-    }
-}
-
-impl From<CancelableError<MappingError>> for MappingError {
-    fn from(cancelable: CancelableError<MappingError>) -> Self {
-        match cancelable {
-            CancelableError::Error(e) => e,
-            CancelableError::Cancel => MappingError::Unknown(anyhow::anyhow!("mapping canceled")),
-        }
     }
 }
 
@@ -46,46 +37,25 @@ impl MappingError {
 /// Common trait for runtime host implementations.
 #[async_trait]
 pub trait RuntimeHost: Send + Sync + Debug + 'static {
-    /// Returns true if the RuntimeHost has a handler for an Ethereum event.
-    fn matches_log(&self, log: &Log) -> bool;
+    fn match_and_decode(
+        &self,
+        trigger: &EthereumTrigger,
+        block: &LightEthereumBlock,
+        logger: &Logger,
+    ) -> Result<Option<MappingTrigger>, Error>;
 
-    /// Returns true if the RuntimeHost has a handler for an Ethereum call.
-    fn matches_call(&self, call: &EthereumCall) -> bool;
-
-    /// Returns true if the RuntimeHost has a handler for an Ethereum block.
-    fn matches_block(&self, call: &EthereumBlockTriggerType, block_number: u64) -> bool;
-
-    /// Process an Ethereum event and return a vector of entity operations.
-    async fn process_log(
+    async fn process_mapping_trigger(
         &self,
         logger: &Logger,
         block: &Arc<LightEthereumBlock>,
-        transaction: &Arc<Transaction>,
-        log: &Arc<Log>,
+        trigger: MappingTrigger,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState, MappingError>;
 
-    /// Process an Ethereum call and return a vector of entity operations
-    async fn process_call(
-        &self,
-        logger: &Logger,
-        block: &Arc<LightEthereumBlock>,
-        transaction: &Arc<Transaction>,
-        call: &Arc<EthereumCall>,
-        state: BlockState,
-        proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, MappingError>;
-
-    /// Process an Ethereum block and return a vector of entity operations
-    async fn process_block(
-        &self,
-        logger: &Logger,
-        block: &Arc<LightEthereumBlock>,
-        trigger_type: &EthereumBlockTriggerType,
-        state: BlockState,
-        proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, MappingError>;
+    /// Block number in which this host was created.
+    /// Returns `None` for static data sources.
+    fn creation_block_number(&self) -> Option<BlockNumber>;
 }
 
 pub struct HostMetrics {
@@ -134,14 +104,40 @@ impl HostMetrics {
 
     pub fn observe_handler_execution_time(&self, duration: f64, handler: &str) {
         self.handler_execution_time
-            .with_label_values(vec![handler].as_slice())
+            .with_label_values(&[handler][..])
             .observe(duration);
     }
 
     pub fn observe_host_fn_execution_time(&self, duration: f64, fn_name: &str) {
         self.host_fn_execution_time
-            .with_label_values(vec![fn_name].as_slice())
+            .with_label_values(&[fn_name][..])
             .observe(duration);
+    }
+
+    pub fn time_host_fn_execution_region(
+        self: Arc<HostMetrics>,
+        fn_name: &'static str,
+    ) -> HostFnExecutionTimer {
+        HostFnExecutionTimer {
+            start: Instant::now(),
+            metrics: self,
+            fn_name,
+        }
+    }
+}
+
+#[must_use]
+pub struct HostFnExecutionTimer {
+    start: Instant,
+    metrics: Arc<HostMetrics>,
+    fn_name: &'static str,
+}
+
+impl Drop for HostFnExecutionTimer {
+    fn drop(&mut self) {
+        let elapsed = (Instant::now() - self.start).as_secs_f64();
+        self.metrics
+            .observe_host_fn_execution_time(elapsed, self.fn_name)
     }
 }
 

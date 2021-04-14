@@ -1,5 +1,4 @@
-use failure;
-use graphql_parser::{query as q, Pos};
+use graphql_parser::Pos;
 use hex::FromHexError;
 use num_bigint;
 use serde::ser::*;
@@ -11,19 +10,20 @@ use std::sync::Arc;
 
 use crate::data::graphql::SerializableValue;
 use crate::data::subgraph::*;
+use crate::prelude::q;
 use crate::{components::store::StoreError, prelude::CacheWeight};
 
 #[derive(Debug)]
-pub struct CloneableFailureError(Arc<failure::Error>);
+pub struct CloneableAnyhowError(Arc<anyhow::Error>);
 
-impl Clone for CloneableFailureError {
+impl Clone for CloneableAnyhowError {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl From<failure::Error> for CloneableFailureError {
-    fn from(f: failure::Error) -> Self {
+impl From<anyhow::Error> for CloneableAnyhowError {
+    fn from(f: anyhow::Error) -> Self {
         Self(Arc::new(f))
     }
 }
@@ -52,7 +52,7 @@ pub enum QueryExecutionError {
     EmptyQuery,
     MultipleSubscriptionFields,
     SubgraphDeploymentIdError(String),
-    RangeArgumentsError(Vec<&'static str>, u32),
+    RangeArgumentsError(&'static str, u32, i64),
     InvalidFilterError,
     EntityFieldError(String, String),
     ListTypesError(String, Vec<String>),
@@ -60,7 +60,7 @@ pub enum QueryExecutionError {
     ValueParseError(String, String),
     AttributeTypeError(String, String),
     EntityParseError(String),
-    StoreError(CloneableFailureError),
+    StoreError(CloneableAnyhowError),
     Timeout,
     EmptySelectionSet(String),
     AmbiguousDerivedFromResult(Pos, String, String, String),
@@ -153,15 +153,8 @@ impl fmt::Display for QueryExecutionError {
             SubgraphDeploymentIdError(s) => {
                 write!(f, "Failed to get subgraph ID from type: `{}`", s)
             }
-            RangeArgumentsError(args, first_limit) => {
-                let msg = args.into_iter().map(|arg| {
-                    match *arg {
-                        "first" => format!("Value of \"first\" must be between 1 and {}", first_limit),
-                        "skip" => format!("Value of \"skip\" must be greater than 0"),
-                        _ => format!("Value of \"{}\" is must be an integer", arg),
-                    }
-                }).collect::<Vec<_>>().join(", ");
-                write!(f, "{}", msg)
+            RangeArgumentsError(arg, max, actual) => {
+                write!(f, "The `{}` argument must be between 0 and {}, but is {}", arg, max, actual)
             }
             InvalidFilterError => write!(f, "Filter must by an object"),
             EntityFieldError(e, a) => {
@@ -255,7 +248,7 @@ impl From<bigdecimal::ParseBigDecimalError> for QueryExecutionError {
 
 impl From<StoreError> for QueryExecutionError {
     fn from(e: StoreError) -> Self {
-        QueryExecutionError::StoreError(CloneableFailureError(Arc::new(e.into())))
+        QueryExecutionError::StoreError(CloneableAnyhowError(Arc::new(e.into())))
     }
 }
 
@@ -265,6 +258,7 @@ pub enum QueryError {
     EncodingError(FromUtf8Error),
     ParseError(Arc<anyhow::Error>),
     ExecutionError(QueryExecutionError),
+    IndexingError,
 }
 
 impl From<FromUtf8Error> for QueryError {
@@ -299,6 +293,9 @@ impl fmt::Display for QueryError {
             QueryError::EncodingError(ref e) => write!(f, "{}", e),
             QueryError::ExecutionError(ref e) => write!(f, "{}", e),
             QueryError::ParseError(ref e) => write!(f, "{}", e),
+
+            // This error message is part of attestable responses.
+            QueryError::IndexingError => write!(f, "indexing_error"),
         }
     }
 }

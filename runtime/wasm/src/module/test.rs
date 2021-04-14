@@ -1,19 +1,18 @@
-use ethabi::Token;
+use ethabi::{Contract, Token};
 use hex;
 use std::collections::{BTreeMap, HashMap};
-use std::io::Cursor;
 use std::str::FromStr;
 
 use crate::host_exports::HostExports;
-use graph::components::store::*;
 use graph::data::store::scalar;
 use graph::data::subgraph::*;
 use graph::mock::MockEthereumAdapter;
+use graph::{components::store::*, ipfs_client::IpfsClient};
 use graph_chain_arweave::adapter::ArweaveAdapter;
 use graph_core;
 use graph_core::three_box::ThreeBoxAdapter;
 use graph_mock::MockMetricsRegistry;
-use test_store::STORE;
+use test_store::{NETWORK_NAME, STORE};
 
 use web3::types::{Address, H160};
 
@@ -24,10 +23,7 @@ mod abi;
 fn test_valid_module_and_store(
     subgraph_id: &str,
     data_source: DataSource,
-) -> (
-    WasmInstance,
-    Arc<impl Store + SubgraphDeploymentStore + EthereumCallCache>,
-) {
+) -> (WasmInstance, Arc<impl SubgraphStore>) {
     test_valid_module_and_store_with_timeout(subgraph_id, data_source, None)
 }
 
@@ -35,14 +31,16 @@ fn test_valid_module_and_store_with_timeout(
     subgraph_id: &str,
     data_source: DataSource,
     timeout: Option<Duration>,
-) -> (
-    WasmInstance,
-    Arc<impl Store + SubgraphDeploymentStore + EthereumCallCache>,
-) {
+) -> (WasmInstance, Arc<impl SubgraphStore>) {
     let store = STORE.clone();
+    let call_cache = store
+        .block_store()
+        .ethereum_call_cache(NETWORK_NAME)
+        .expect("call cache for test network");
     let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let deployment_id = SubgraphDeploymentId::new(subgraph_id).unwrap();
     test_store::create_test_subgraph(
-        subgraph_id,
+        &deployment_id,
         "type User @entity {
             id: ID!,
             name: String,
@@ -54,7 +52,6 @@ fn test_valid_module_and_store_with_timeout(
             extra: String
         }",
     );
-    let deployment_id = SubgraphDeploymentId::new(subgraph_id).unwrap();
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment_id.clone(),
@@ -66,16 +63,27 @@ fn test_valid_module_and_store_with_timeout(
         stopwatch_metrics,
     ));
 
+    let experimental_features = ExperimentalFeatures {
+        allow_non_deterministic_ipfs: true,
+        allow_non_deterministic_arweave: true,
+        allow_non_deterministic_3box: true,
+    };
+
     let module = WasmInstance::from_valid_module_with_ctx(
         Arc::new(ValidModule::new(data_source.mapping.runtime.as_ref()).unwrap()),
-        mock_context(deployment_id, data_source, store.clone()),
+        mock_context(
+            deployment_id,
+            data_source,
+            store.subgraph_store(),
+            call_cache,
+        ),
         host_metrics,
         timeout,
-        true,
+        experimental_features,
     )
     .unwrap();
 
-    (module, store)
+    (module, store.subgraph_store())
 }
 
 fn test_module(subgraph_id: &str, data_source: DataSource) -> WasmInstance {
@@ -96,7 +104,7 @@ fn mock_data_source(path: &str) -> DataSource {
         },
         mapping: Mapping {
             kind: String::from("ethereum/events"),
-            api_version: String::from("0.1.0"),
+            api_version: Version::parse("0.1.0").unwrap(),
             language: String::from("wasm/assemblyscript"),
             entities: vec![],
             abis: vec![],
@@ -108,56 +116,76 @@ fn mock_data_source(path: &str) -> DataSource {
             },
             runtime: Arc::new(runtime.clone()),
         },
-        templates: vec![DataSourceTemplate {
-            kind: String::from("ethereum/contract"),
-            name: String::from("example template"),
-            network: Some(String::from("mainnet")),
-            source: TemplateSource {
-                abi: String::from("foo"),
-            },
-            mapping: Mapping {
-                kind: String::from("ethereum/events"),
-                api_version: String::from("0.1.0"),
-                language: String::from("wasm/assemblyscript"),
-                entities: vec![],
-                abis: vec![],
-                event_handlers: vec![],
-                call_handlers: vec![],
-                block_handlers: vec![],
-                link: Link {
-                    link: "link".to_owned(),
-                },
-                runtime: Arc::new(runtime),
-            },
-        }],
-        context: None,
+        context: Default::default(),
+        creation_block: None,
+        contract_abi: Arc::new(mock_abi()),
+    }
+}
+
+fn mock_abi() -> MappingABI {
+    MappingABI {
+        name: "mock_abi".to_string(),
+        contract: Contract::load(
+            r#"[
+            {
+                "inputs": [
+                    {
+                        "name": "a",
+                        "type": "address"
+                    }
+                ],
+                "type": "constructor"
+            }
+        ]"#
+            .as_bytes(),
+        )
+        .unwrap(),
     }
 }
 
 fn mock_host_exports(
     subgraph_id: SubgraphDeploymentId,
     data_source: DataSource,
-    store: Arc<impl Store + SubgraphDeploymentStore + EthereumCallCache>,
+    store: Arc<impl SubgraphStore>,
+    call_cache: Arc<impl EthereumCallCache>,
 ) -> HostExports {
     let mock_ethereum_adapter = Arc::new(MockEthereumAdapter::default());
     let arweave_adapter = Arc::new(ArweaveAdapter::new("https://arweave.net".to_string()));
     let three_box_adapter = Arc::new(ThreeBoxAdapter::new("https://ipfs.3box.io/".to_string()));
 
+    let templates = vec![DataSourceTemplate {
+        kind: String::from("ethereum/contract"),
+        name: String::from("example template"),
+        network: Some(String::from("mainnet")),
+        source: TemplateSource {
+            abi: String::from("foo"),
+        },
+        mapping: Mapping {
+            kind: String::from("ethereum/events"),
+            api_version: Version::parse("0.1.0").unwrap(),
+            language: String::from("wasm/assemblyscript"),
+            entities: vec![],
+            abis: vec![],
+            event_handlers: vec![],
+            call_handlers: vec![],
+            block_handlers: vec![],
+            link: Link {
+                link: "link".to_owned(),
+            },
+            runtime: Arc::new(vec![]),
+        },
+    }];
+
+    let network = data_source.network.clone().unwrap();
     HostExports::new(
         subgraph_id,
-        Version::parse(&data_source.mapping.api_version).unwrap(),
-        data_source.name,
-        data_source.source.address,
-        data_source.network.unwrap(),
-        data_source.context,
-        Arc::new(data_source.templates),
-        data_source.mapping.abis,
+        &data_source,
+        network,
+        Arc::new(templates),
         mock_ethereum_adapter,
-        Arc::new(graph_core::LinkResolver::from(
-            ipfs_api::IpfsClient::default(),
-        )),
-        store.clone(),
+        Arc::new(graph_core::LinkResolver::from(IpfsClient::localhost())),
         store,
+        call_cache,
         arweave_adapter,
         three_box_adapter,
     )
@@ -166,12 +194,21 @@ fn mock_host_exports(
 fn mock_context(
     subgraph_id: SubgraphDeploymentId,
     data_source: DataSource,
-    store: Arc<impl Store + SubgraphDeploymentStore + EthereumCallCache>,
+    store: Arc<impl SubgraphStore>,
+    call_cache: Arc<impl EthereumCallCache>,
 ) -> MappingContext {
+    let mut block = LightEthereumBlock::default();
+    block.hash = Some(Default::default());
+    block.number = Some(0.into());
     MappingContext {
         logger: test_store::LOGGER.clone(),
-        block: Default::default(),
-        host_exports: Arc::new(mock_host_exports(subgraph_id, data_source, store.clone())),
+        block: Arc::new(block),
+        host_exports: Arc::new(mock_host_exports(
+            subgraph_id,
+            data_source,
+            store.clone(),
+            call_cache,
+        )),
         state: BlockState::new(store, Default::default()),
         proof_of_indexing: None,
     }
@@ -179,14 +216,14 @@ fn mock_context(
 
 impl WasmInstance {
     fn invoke_export<C, R>(&self, f: &str, arg: AscPtr<C>) -> AscPtr<R> {
-        let func = self.get_func(f).get1().unwrap();
-        let ptr: u32 = func(arg.wasm_ptr()).unwrap();
+        let func = self.get_func(f).typed().unwrap().clone();
+        let ptr: u32 = func.call(arg.wasm_ptr()).unwrap();
         ptr.into()
     }
 
     fn invoke_export2<C, D, R>(&self, f: &str, arg0: AscPtr<C>, arg1: AscPtr<D>) -> AscPtr<R> {
-        let func = self.get_func(f).get2().unwrap();
-        let ptr: u32 = func(arg0.wasm_ptr(), arg1.wasm_ptr()).unwrap();
+        let func = self.get_func(f).typed().unwrap().clone();
+        let ptr: u32 = func.call((arg0.wasm_ptr(), arg1.wasm_ptr())).unwrap();
         ptr.into()
     }
 
@@ -196,18 +233,18 @@ impl WasmInstance {
         arg0: AscPtr<C>,
         arg1: AscPtr<D>,
     ) -> Result<(), wasmtime::Trap> {
-        let func = self.get_func(f).get2().unwrap();
-        func(arg0.wasm_ptr(), arg1.wasm_ptr())
+        let func = self.get_func(f).typed().unwrap().clone();
+        func.call((arg0.wasm_ptr(), arg1.wasm_ptr()))
     }
 
     fn takes_ptr_returns_val<P, V: wasmtime::WasmTy>(&mut self, fn_name: &str, v: AscPtr<P>) -> V {
-        let func = self.get_func(fn_name).get1().unwrap();
-        func(v.wasm_ptr()).unwrap()
+        let func = self.get_func(fn_name).typed().unwrap().clone();
+        func.call(v.wasm_ptr()).unwrap()
     }
 
     fn takes_val_returns_ptr<P>(&mut self, fn_name: &str, val: impl wasmtime::WasmTy) -> AscPtr<P> {
-        let func = self.get_func(fn_name).get1().unwrap();
-        let ptr: u32 = func(val).unwrap();
+        let func = self.get_func(fn_name).typed().unwrap().clone();
+        let ptr: u32 = func.call(val).unwrap();
         ptr.into()
     }
 }
@@ -221,27 +258,27 @@ async fn json_conversions() {
 
     // test u64 conversion
     let number = 9223372036850770800;
-    let number_ptr = module.asc_new(&number.to_string());
+    let number_ptr = module.asc_new(&number.to_string()).unwrap();
     let converted: i64 = module.takes_ptr_returns_val("testToU64", number_ptr);
     assert_eq!(number, u64::from_le_bytes(converted.to_le_bytes()));
 
     // test i64 conversion
     let number = -9223372036850770800;
-    let number_ptr = module.asc_new(&number.to_string());
+    let number_ptr = module.asc_new(&number.to_string()).unwrap();
     let converted: i64 = module.takes_ptr_returns_val("testToI64", number_ptr);
     assert_eq!(number, converted);
 
     // test f64 conversion
     let number = -9223372036850770.92345034;
-    let number_ptr = module.asc_new(&number.to_string());
+    let number_ptr = module.asc_new(&number.to_string()).unwrap();
     let converted: f64 = module.takes_ptr_returns_val("testToF64", number_ptr);
     assert_eq!(number, converted);
 
     // test BigInt conversion
     let number = "-922337203685077092345034";
-    let number_ptr = module.asc_new(number);
+    let number_ptr = module.asc_new(number).unwrap();
     let big_int_obj: AscPtr<AscBigInt> = module.invoke_export("testToBigInt", number_ptr);
-    let bytes: Vec<u8> = module.asc_get(big_int_obj);
+    let bytes: Vec<u8> = module.asc_get(big_int_obj).unwrap();
     assert_eq!(
         scalar::BigInt::from_str(number).unwrap(),
         scalar::BigInt::from_signed_bytes_le(&bytes)
@@ -258,39 +295,38 @@ async fn json_parsing() {
     // Parse invalid JSON and handle the error gracefully
     let s = "foo"; // Invalid because there are no quotes around `foo`
     let bytes: &[u8] = s.as_ref();
-    let bytes_ptr = module.asc_new(bytes);
+    let bytes_ptr = module.asc_new(bytes).unwrap();
     let return_value: AscPtr<AscString> = module.invoke_export("handleJsonError", bytes_ptr);
-    let output: String = module.asc_get(return_value);
+    let output: String = module.asc_get(return_value).unwrap();
     assert_eq!(output, "ERROR: true");
 
     // Parse valid JSON and get it back
     let s = "\"foo\""; // Valid because there are quotes around `foo`
     let bytes: &[u8] = s.as_ref();
-    let bytes_ptr = module.asc_new(bytes);
+    let bytes_ptr = module.asc_new(bytes).unwrap();
     let return_value: AscPtr<AscString> = module.invoke_export("handleJsonError", bytes_ptr);
-    let output: String = module.asc_get(return_value);
+    let output: String = module.asc_get(return_value).unwrap();
     assert_eq!(output, "OK: foo");
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn ipfs_cat() {
-    let ipfs = Arc::new(ipfs_api::IpfsClient::default());
-    let hash = ipfs.add(Cursor::new("42")).await.unwrap().hash;
+    let ipfs = IpfsClient::localhost();
+    let hash = ipfs.add("42".into()).await.unwrap().hash;
 
     // Ipfs host functions use `block_on` which must be called from a sync context,
     // so we replicate what we do `spawn_module`.
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
-        runtime.enter(|| {
-            let mut module = test_module("ipfsCat", mock_data_source("wasm_test/ipfs_cat.wasm"));
-            let arg = module.asc_new(&hash);
-            let converted: AscPtr<AscString> = module.invoke_export("ipfsCatString", arg);
-            let data: String = module.instance_ctx().asc_get(converted);
-            assert_eq!(data, "42");
-        })
+        let _runtime_guard = runtime.enter();
+        let mut module = test_module("ipfsCat", mock_data_source("wasm_test/ipfs_cat.wasm"));
+        let arg = module.asc_new(&hash).unwrap();
+        let converted: AscPtr<AscString> = module.invoke_export("ipfsCatString", arg);
+        let data: String = module.instance_ctx().asc_get(converted).unwrap();
+        assert_eq!(data, "42");
     })
     .join()
-    .unwrap()
+    .unwrap();
 }
 
 // The user_data value we use with calls to ipfs_map
@@ -301,71 +337,71 @@ fn make_thing(subgraph_id: &str, id: &str, value: &str) -> (String, EntityModifi
     data.set("id", id);
     data.set("value", value);
     data.set("extra", USER_DATA);
-    let key = EntityKey {
-        subgraph_id: SubgraphDeploymentId::new(subgraph_id).unwrap(),
-        entity_type: "Thing".to_string(),
-        entity_id: id.to_string(),
-    };
+    let key = EntityKey::data(
+        SubgraphDeploymentId::new(subgraph_id).unwrap(),
+        "Thing".to_string(),
+        id.to_string(),
+    );
     (
         format!("{{ \"id\": \"{}\", \"value\": \"{}\"}}", id, value),
         EntityModification::Insert { key, data },
     )
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn ipfs_map() {
     const BAD_IPFS_HASH: &str = "bad-ipfs-hash";
 
-    let ipfs = Arc::new(ipfs_api::IpfsClient::default());
+    let ipfs = IpfsClient::localhost();
     let subgraph_id = "ipfsMap";
 
     async fn run_ipfs_map(
-        ipfs: Arc<ipfs_api::IpfsClient>,
+        ipfs: IpfsClient,
         subgraph_id: &'static str,
         json_string: String,
     ) -> Result<Vec<EntityModification>, anyhow::Error> {
         let hash = if json_string == BAD_IPFS_HASH {
             "Qm".to_string()
         } else {
-            ipfs.add(Cursor::new(json_string)).await.unwrap().hash
+            ipfs.add(json_string.into()).await.unwrap().hash
         };
 
         // Ipfs host functions use `block_on` which must be called from a sync context,
         // so we replicate what we do `spawn_module`.
         let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
-            runtime.enter(|| {
-                let (mut module, store) = test_valid_module_and_store(
-                    subgraph_id,
-                    mock_data_source("wasm_test/ipfs_map.wasm"),
-                );
-                let value = module.asc_new(&hash);
-                let user_data = module.asc_new(USER_DATA);
+            let _runtime_guard = runtime.enter();
 
-                // Invoke the callback
-                let func = module.get_func("ipfsMap").get2().unwrap();
-                let _: () = func(value.wasm_ptr(), user_data.wasm_ptr())?;
-                let mut mods = module
-                    .take_ctx()
-                    .ctx
-                    .state
-                    .entity_cache
-                    .as_modifications(store.as_ref())?
-                    .modifications;
+            let (mut module, store) = test_valid_module_and_store(
+                subgraph_id,
+                mock_data_source("wasm_test/ipfs_map.wasm"),
+            );
+            let value = module.asc_new(&hash).unwrap();
+            let user_data = module.asc_new(USER_DATA).unwrap();
 
-                // Bring the modifications into a predictable order (by entity_id)
-                mods.sort_by(|a, b| {
-                    a.entity_key()
-                        .entity_id
-                        .partial_cmp(&b.entity_key().entity_id)
-                        .unwrap()
-                });
-                Ok(mods)
-            })
+            // Invoke the callback
+            let func = module.get_func("ipfsMap").typed().unwrap().clone();
+            let _: () = func.call((value.wasm_ptr(), user_data.wasm_ptr()))?;
+            let mut mods = module
+                .take_ctx()
+                .ctx
+                .state
+                .entity_cache
+                .as_modifications(store.as_ref())?
+                .modifications;
+
+            // Bring the modifications into a predictable order (by entity_id)
+            mods.sort_by(|a, b| {
+                a.entity_key()
+                    .entity_id
+                    .partial_cmp(&b.entity_key().entity_id)
+                    .unwrap()
+            });
+            Ok(mods)
         })
         .join()
         .unwrap()
-    };
+    }
 
     // Try it with two valid objects
     let (str1, thing1) = make_thing(subgraph_id, "one", "eins");
@@ -383,7 +419,8 @@ async fn ipfs_map() {
         .unwrap_err();
     assert!(
         format!("{:#}", err).contains("JSON value is not an object."),
-        format!("{:#}", err)
+        "{:#}",
+        err
     );
 
     // Malformed JSON
@@ -417,37 +454,37 @@ async fn ipfs_map() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(errmsg.contains("ApiError"));
+    assert!(errmsg.contains("Status(500)"));
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn ipfs_fail() {
     let runtime = tokio::runtime::Handle::current();
 
     // Ipfs host functions use `block_on` which must be called from a sync context,
     // so we replicate what we do `spawn_module`.
     std::thread::spawn(move || {
-        runtime.enter(|| {
-            let mut module = test_module("ipfsFail", mock_data_source("wasm_test/ipfs_cat.wasm"));
+        let _runtime_guard = runtime.enter();
 
-            let hash = module.asc_new("invalid hash");
-            assert!(module
-                .invoke_export::<_, AscString>("ipfsCat", hash,)
-                .is_null());
-        })
+        let mut module = test_module("ipfsFail", mock_data_source("wasm_test/ipfs_cat.wasm"));
+
+        let hash = module.asc_new("invalid hash").unwrap();
+        assert!(module
+            .invoke_export::<_, AscString>("ipfsCat", hash,)
+            .is_null());
     })
     .join()
-    .unwrap()
+    .unwrap();
 }
 
 #[tokio::test]
 async fn crypto_keccak256() {
     let mut module = test_module("cryptoKeccak256", mock_data_source("wasm_test/crypto.wasm"));
     let input: &[u8] = "eth".as_ref();
-    let input: AscPtr<Uint8Array> = module.asc_new(input);
+    let input: AscPtr<Uint8Array> = module.asc_new(input).unwrap();
 
     let hash: AscPtr<Uint8Array> = module.invoke_export("hash", input);
-    let hash: Vec<u8> = module.asc_get(hash);
+    let hash: Vec<u8> = module.asc_get(hash).unwrap();
     assert_eq!(
         hex::encode(hash),
         "4f5b812789fc606be1b3b16908db13fc7a9adf7ca72641f84d75b47069d3d7f0"
@@ -463,23 +500,23 @@ async fn big_int_to_hex() {
 
     // Convert zero to hex
     let zero = BigInt::from_unsigned_u256(&U256::zero());
-    let zero: AscPtr<AscBigInt> = module.asc_new(&zero);
+    let zero: AscPtr<AscBigInt> = module.asc_new(&zero).unwrap();
     let zero_hex_ptr: AscPtr<AscString> = module.invoke_export("big_int_to_hex", zero);
-    let zero_hex_str: String = module.asc_get(zero_hex_ptr);
+    let zero_hex_str: String = module.asc_get(zero_hex_ptr).unwrap();
     assert_eq!(zero_hex_str, "0x0");
 
     // Convert 1 to hex
     let one = BigInt::from_unsigned_u256(&U256::one());
-    let one: AscPtr<AscBigInt> = module.asc_new(&one);
+    let one: AscPtr<AscBigInt> = module.asc_new(&one).unwrap();
     let one_hex_ptr: AscPtr<AscString> = module.invoke_export("big_int_to_hex", one);
-    let one_hex_str: String = module.asc_get(one_hex_ptr);
+    let one_hex_str: String = module.asc_get(one_hex_ptr).unwrap();
     assert_eq!(one_hex_str, "0x1");
 
     // Convert U256::max_value() to hex
     let u256_max = BigInt::from_unsigned_u256(&U256::max_value());
-    let u256_max: AscPtr<AscBigInt> = module.asc_new(&u256_max);
+    let u256_max: AscPtr<AscBigInt> = module.asc_new(&u256_max).unwrap();
     let u256_max_hex_ptr: AscPtr<AscString> = module.invoke_export("big_int_to_hex", u256_max);
-    let u256_max_hex_str: String = module.asc_get(u256_max_hex_ptr);
+    let u256_max_hex_str: String = module.asc_get(u256_max_hex_ptr).unwrap();
     assert_eq!(
         u256_max_hex_str,
         "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -495,64 +532,63 @@ async fn big_int_arithmetic() {
 
     // 0 + 1 = 1
     let zero = BigInt::from(0);
-    let zero: AscPtr<AscBigInt> = module.asc_new(&zero);
+    let zero: AscPtr<AscBigInt> = module.asc_new(&zero).unwrap();
     let one = BigInt::from(1);
-    let one: AscPtr<AscBigInt> = module.asc_new(&one);
+    let one: AscPtr<AscBigInt> = module.asc_new(&one).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("plus", zero, one);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(1));
 
     // 127 + 1 = 128
     let zero = BigInt::from(127);
-    let zero: AscPtr<AscBigInt> = module.asc_new(&zero);
+    let zero: AscPtr<AscBigInt> = module.asc_new(&zero).unwrap();
     let one = BigInt::from(1);
-    let one: AscPtr<AscBigInt> = module.asc_new(&one);
+    let one: AscPtr<AscBigInt> = module.asc_new(&one).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("plus", zero, one);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(128));
 
     // 5 - 10 = -5
     let five = BigInt::from(5);
-    let five: AscPtr<AscBigInt> = module.asc_new(&five);
+    let five: AscPtr<AscBigInt> = module.asc_new(&five).unwrap();
     let ten = BigInt::from(10);
-    let ten: AscPtr<AscBigInt> = module.asc_new(&ten);
+    let ten: AscPtr<AscBigInt> = module.asc_new(&ten).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("minus", five, ten);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(-5));
 
     // -20 * 5 = -100
     let minus_twenty = BigInt::from(-20);
-    let minus_twenty: AscPtr<AscBigInt> = module.asc_new(&minus_twenty);
+    let minus_twenty: AscPtr<AscBigInt> = module.asc_new(&minus_twenty).unwrap();
     let five = BigInt::from(5);
-    let five: AscPtr<AscBigInt> = module.asc_new(&five);
+    let five: AscPtr<AscBigInt> = module.asc_new(&five).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("times", minus_twenty, five);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(-100));
 
     // 5 / 2 = 2
     let five = BigInt::from(5);
-    let five: AscPtr<AscBigInt> = module.asc_new(&five);
+    let five: AscPtr<AscBigInt> = module.asc_new(&five).unwrap();
     let two = BigInt::from(2);
-    let two: AscPtr<AscBigInt> = module.asc_new(&two);
+    let two: AscPtr<AscBigInt> = module.asc_new(&two).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("dividedBy", five, two);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(2));
 
     // 5 % 2 = 1
     let five = BigInt::from(5);
-    let five: AscPtr<AscBigInt> = module.asc_new(&five);
+    let five: AscPtr<AscBigInt> = module.asc_new(&five).unwrap();
     let two = BigInt::from(2);
-    let two: AscPtr<AscBigInt> = module.asc_new(&two);
+    let two: AscPtr<AscBigInt> = module.asc_new(&two).unwrap();
     let result_ptr: AscPtr<AscBigInt> = module.invoke_export2("mod", five, two);
-    let result: BigInt = module.asc_get(result_ptr);
+    let result: BigInt = module.asc_get(result_ptr).unwrap();
     assert_eq!(result, BigInt::from(1));
 }
 
 #[tokio::test]
 async fn abort() {
     let module = test_module("abort", mock_data_source("wasm_test/abort.wasm"));
-    let func = module.get_func("abort").get0().unwrap();
-    let res: Result<(), _> = func();
+    let res: Result<(), _> = module.get_func("abort").typed().unwrap().call(());
     assert!(res
         .unwrap_err()
         .to_string()
@@ -567,9 +603,9 @@ async fn bytes_to_base58() {
     );
     let bytes = hex::decode("12207D5A99F603F231D53A4F39D1521F98D2E8BB279CF29BEBFD0687DC98458E7F89")
         .unwrap();
-    let bytes_ptr = module.asc_new(bytes.as_slice());
+    let bytes_ptr = module.asc_new(bytes.as_slice()).unwrap();
     let result_ptr: AscPtr<AscString> = module.invoke_export("bytes_to_base58", bytes_ptr);
-    let base58: String = module.asc_get(result_ptr);
+    let base58: String = module.asc_get(result_ptr).unwrap();
     assert_eq!(base58, "QmWmyoMoctfbAaiEs2G46gpeUmhqFRDW6KWo64y5r581Vz");
 }
 
@@ -583,19 +619,19 @@ async fn data_source_create() {
             mock_data_source("wasm_test/data_source_create.wasm"),
         );
 
-        let name = module.asc_new(&name);
-        let params = module.asc_new(&*params);
+        let name = module.asc_new(&name).unwrap();
+        let params = module.asc_new(&*params).unwrap();
+        module.instance_ctx_mut().ctx.state.enter_handler();
         module.invoke_export2_void("dataSourceCreate", name, params)?;
-        Ok(module.take_ctx().ctx.state.created_data_sources)
+        module.instance_ctx_mut().ctx.state.exit_handler();
+        Ok(module.take_ctx().ctx.state.drain_created_data_sources())
     };
 
     // Test with a valid template
-    let data_source = String::from("example data source");
     let template = String::from("example template");
     let params = vec![String::from("0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95")];
     let result = run_data_source_create(template.clone(), params.clone())
         .expect("unexpected error returned from dataSourceCreate");
-    assert_eq!(result[0].data_source, data_source);
     assert_eq!(result[0].params, params.clone());
     assert_eq!(result[0].template.name, template);
 
@@ -622,12 +658,12 @@ async fn ens_name_by_hash() {
     let hash = "0x7f0c1b04d1a4926f9c635a030eeb611d4c26e5e73291b32a1c7a4ac56935b5b3";
     let name = "dealdrafts";
     test_store::insert_ens_name(hash, name);
-    let val = module.asc_new(hash);
+    let val = module.asc_new(hash).unwrap();
     let converted: AscPtr<AscString> = module.invoke_export("nameByHash", val);
-    let data: String = module.asc_get(converted);
+    let data: String = module.asc_get(converted).unwrap();
     assert_eq!(data, name);
 
-    let hash = module.asc_new("impossible keccak hash");
+    let hash = module.asc_new("impossible keccak hash").unwrap();
     assert!(module
         .invoke_export::<_, AscString>("nameByHash", hash)
         .is_null());
@@ -645,10 +681,15 @@ async fn entity_store() {
     steve.set("id", "steve");
     steve.set("name", "Steve");
     let subgraph_id = SubgraphDeploymentId::new("entityStore").unwrap();
-    test_store::insert_entities(subgraph_id, vec![("User", alex), ("User", steve)]).unwrap();
+    let user_type = EntityType::from("User");
+    test_store::insert_entities(
+        subgraph_id,
+        vec![(user_type.clone(), alex), (user_type, steve)],
+    )
+    .unwrap();
 
     let get_user = move |module: &mut WasmInstance, id: &str| -> Option<Entity> {
-        let id = module.asc_new(id);
+        let id = module.asc_new(id).unwrap();
         let entity_ptr: AscPtr<AscEntity> = module.invoke_export("getUser", id);
         if entity_ptr.is_null() {
             None
@@ -662,8 +703,8 @@ async fn entity_store() {
     };
 
     let load_and_set_user_name = |module: &mut WasmInstance, id: &str, name: &str| {
-        let id_ptr = module.asc_new(id);
-        let name_ptr = module.asc_new(name);
+        let id_ptr = module.asc_new(id).unwrap();
+        let name_ptr = module.asc_new(name).unwrap();
         module
             .invoke_export2_void("loadAndSetUserName", id_ptr, name_ptr)
             .unwrap();
