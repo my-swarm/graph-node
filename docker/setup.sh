@@ -2,8 +2,8 @@
 
 
 if [ "$1" == "kovan" ]; then
-  echo "Setting up for kovan"
-  NETWORK=kovan
+	echo "Setting up for kovan"
+	NETWORK=kovan
 	PORT_IPFS=5201
 	PORT_PG=54322
 	PORT_GRAPH_1=8200
@@ -15,8 +15,8 @@ if [ "$1" == "kovan" ]; then
 	ETHEREUM_HOST="kovan:https:\/\/eth-kovan.alchemyapi.io\/v2\/Sb74BO2GTM5-9rUJcc441atUNbKYTekj"
 
 elif [ "$1" == "mainnet" ]; then
-  echo "Setting up for mainnet"
-  NETWORK=mainnet
+	echo "Setting up for mainnet"
+	NETWORK=mainnet
 	PORT_IPFS=5301
 	PORT_PG=54323
 	PORT_GRAPH_1=8300
@@ -26,8 +26,8 @@ elif [ "$1" == "mainnet" ]; then
 	PORT_GRAPH_5=8340
 	ETHEREUM_HOST="mainnet:https:\/\/mainnet.infura.io\/v3\/4aaace1ae3d8484f81138b24012ae2d2"
 else
-  echo "Setting up for local testnet"
-  NETWORK=local
+	echo "Setting up for local testnet"
+	NETWORK=local
 	PORT_IPFS=5101
 	PORT_PG=54321
 	PORT_GRAPH_1=8100
@@ -38,7 +38,7 @@ else
 	ETHEREUM_HOST="mainnet:http:\/\/{host.docker.internal}:8545"
 fi
 
-sed -e "s/{ethereum.host}/$ETHEREUM_HOST/g; s/{port.ipfs}/$PORT_IPFS/g; s/{port.pg}/$PORT_PG/g; s/{port.graph.1}/$PORT_GRAPH_1/g; s/{port.graph.2}/$PORT_GRAPH_2/g; s/{port.graph.3}/$PORT_GRAPH_3/g; s/{port.graph.4}/$PORT_GRAPH_4/g; s/{port.graph.5}/$PORT_GRAPH_5/g;" docker-compose.yml.template > docker-compose.yml.tmp
+sed -e "s/{network}/$NETWORK/g; s/{ethereum.host}/$ETHEREUM_HOST/g; s/{port.ipfs}/$PORT_IPFS/g; s/{port.pg}/$PORT_PG/g; s/{port.graph.1}/$PORT_GRAPH_1/g; s/{port.graph.2}/$PORT_GRAPH_2/g; s/{port.graph.3}/$PORT_GRAPH_3/g; s/{port.graph.4}/$PORT_GRAPH_4/g; s/{port.graph.5}/$PORT_GRAPH_5/g;" docker-compose.yml.template > docker-compose.yml.tmp
 
 set -e
 
@@ -60,18 +60,18 @@ fi
 
 function stop_graph_node {
   # Ensure graph-node is stopped
-  docker-compose stop graph-node
+  docker-compose stop graph-node-$NETWORK
 }
 
-#if [ "$NETWORK" == "local" ]; then
+if [ "$NETWORK" == "local" ]; then
   # Create the graph-node container
-  docker-compose up --no-start graph-node
+  docker-compose up --remove-orphans --no-start graph-node-$NETWORK
 
   # Start graph-node so we can inspect it
-  docker-compose start graph-node
+  docker-compose start graph-node-$NETWORK
 
   # Identify the container ID
-  CONTAINER_ID=$(docker container ls | grep graph-node | cut -d' ' -f1)
+  CONTAINER_ID=$(docker container ls | grep graph-node-$NETWORKz | cut -d' ' -f1)
 
 	HOST_IP=$(docker inspect "$CONTAINER_ID" | jq -r .[0].NetworkSettings.Networks[].Gateway)
   echo "Local ethereum host IP: $HOST_IP"
@@ -80,8 +80,8 @@ function stop_graph_node {
   sed -e "s/{host.docker.internal}/$HOST_IP/g" docker-compose.yml.tmp > docker-compose.yml
 
   trap stop_graph_node EXIT
-#else
- # mv docker-compose.yml.tmp docker-compose.yml
-#fi
+else
+  mv docker-compose.yml.tmp docker-compose.yml
+fi
 echo "Ethereum host: $ETHEREUM_HOST"
 

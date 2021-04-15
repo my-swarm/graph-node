@@ -26,4 +26,5 @@
 /tests/integration-tests/**/truffle_output
 /tests/integration-tests/**/*.bin
 
+docker/docker-compose.yml
 docker/docker-compose.yml.tmp
